@@ -22,6 +22,9 @@ BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 BINANCE_REST = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 COINBASE_REST = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
+# Price is considered stale (feed likely disconnected) after this many seconds
+STALE_SECS = 60
+
 
 class BTCPriceFeed:
     """
@@ -49,9 +52,21 @@ class BTCPriceFeed:
         return time.monotonic() - self._last_update
 
     @property
+    def has_price(self) -> bool:
+        """True once at least one valid price has been received."""
+        return self._last_update > 0 and self._price > 0
+
+    @property
     def is_fresh(self) -> bool:
         """True if price was updated in the last 5 seconds."""
         return self.age_secs < 5
+
+    @property
+    def is_stale(self) -> bool:
+        """True if feed connected before but hasn't updated in STALE_SECS.
+        Indicates the WebSocket/REST connection has likely dropped.
+        """
+        return self.has_price and self.age_secs > STALE_SECS
 
     def _update(self, price: float):
         self._price = price

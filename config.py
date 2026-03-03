@@ -43,6 +43,10 @@ MM_REBALANCE_INTERVAL = 30
 # How many top reward markets to target for market making
 MM_TARGET_MARKETS = 5
 
+# Minimum active-market count below which the bot enters safe mode (no new entries).
+# Protects against acting on a severely truncated market list (e.g. API degraded).
+MIN_MARKETS_THRESHOLD = int(os.getenv("MIN_MARKETS_THRESHOLD", "10"))
+
 
 def validate():
     if not PRIVATE_KEY:

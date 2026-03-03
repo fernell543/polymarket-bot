@@ -62,6 +62,11 @@ class Bot:
       - `markets_cache`: refreshed every MARKETS_REFRESH_SECS and passed
         by reference to strategies that need the full market list.
       - `price_feed`: single BTCPriceFeed instance shared between strategies.
+
+    Safe-mode rules (no new positions opened when any condition is true):
+      - Market list shorter than config.MIN_MARKETS_THRESHOLD
+      - BTC price feed has never delivered a price (has_price=False)
+      - BTC price feed is stale (is_stale=True, age > 60 s)
     """
 
     MARKETS_REFRESH_SECS = 120
@@ -95,6 +100,19 @@ class Bot:
             log.info("LIVE TRADING MODE — wallet %s", config.WALLET_ADDRESS)
 
         await self.client.start()
+
+        # Startup health checks — must pass before we spawn any trading tasks
+        healthy = await self._health_check()
+        if not healthy:
+            if config.DRY_RUN:
+                log.warning("Health check issues detected — continuing in DRY_RUN mode")
+            else:
+                await self.client.stop()
+                raise RuntimeError(
+                    "Startup health check failed in LIVE mode — aborting. "
+                    "Check logs above for actionable errors."
+                )
+
         self._running = True
         self._start_time = time.monotonic()
 
@@ -122,17 +140,118 @@ class Bot:
         log.info("Bot stopped. Final stats:\n%s", self._format_stats())
 
     # ------------------------------------------------------------------
+    # Startup health checks
+    # ------------------------------------------------------------------
+
+    async def _health_check(self) -> bool:
+        """Validate critical dependencies before trading loops start.
+
+        Checks:
+          1. Env vars present (live mode only).
+          2. CLOB API reachable (test fetch of 1 market).
+          3. Auth client initialised (live mode only).
+
+        Returns True if all checks pass (or only warnings in dry-run).
+        Returns False if any fatal check fails.
+        """
+        ok = True
+        log.info("=" * 60)
+        log.info("  STARTUP HEALTH CHECKS")
+        log.info("=" * 60)
+
+        # 1. Environment variables (only fatal in live mode)
+        if not config.DRY_RUN:
+            if not config.PRIVATE_KEY:
+                log.error("  [FAIL] PRIVATE_KEY not set — add it to .env")
+                ok = False
+            else:
+                log.info("  [OK]   PRIVATE_KEY present")
+
+            if not config.WALLET_ADDRESS:
+                log.error("  [FAIL] WALLET_ADDRESS not set — add it to .env")
+                ok = False
+            else:
+                log.info("  [OK]   WALLET_ADDRESS present")
+        else:
+            log.info("  [SKIP] Env-var check (DRY_RUN mode)")
+
+        # 2. API connectivity
+        try:
+            test = await self.client.get_markets(active_only=True, limit=1)
+            if test:
+                log.info("  [OK]   CLOB API reachable (%d market returned)", len(test))
+            else:
+                log.warning("  [WARN] CLOB API reachable but returned 0 markets")
+        except Exception as exc:
+            log.error("  [FAIL] Cannot reach CLOB API: %s", exc)
+            log.error("         Check CLOB_HOST in .env and network connectivity")
+            ok = False
+
+        # 3. Auth client (live mode only)
+        if not config.DRY_RUN:
+            if self.client._clob_client is None:
+                log.error(
+                    "  [FAIL] Auth client not initialised — "
+                    "install py-clob-client and verify PRIVATE_KEY"
+                )
+                ok = False
+            else:
+                log.info("  [OK]   Auth client initialised")
+        else:
+            log.info("  [SKIP] Auth client check (DRY_RUN mode)")
+
+        if ok:
+            log.info("  All health checks passed — bot starting")
+        else:
+            log.error("  One or more health checks FAILED — see above")
+        log.info("=" * 60)
+        return ok
+
+    # ------------------------------------------------------------------
+    # Safe-mode guard
+    # ------------------------------------------------------------------
+
+    def _safe_to_trade(self) -> bool:
+        """Return True only when data confidence is sufficient for new entries.
+
+        False when:
+          - Market list is smaller than MIN_MARKETS_THRESHOLD (API degraded).
+          - (Price-feed staleness is checked separately per-strategy loop.)
+        """
+        return len(self._markets_cache) >= config.MIN_MARKETS_THRESHOLD
+
+    # ------------------------------------------------------------------
     # Shared market cache
     # ------------------------------------------------------------------
 
     async def _refresh_markets(self):
+        """Fetch fresh market list, preserving the existing cache on failure
+        or when the new result looks suspiciously small."""
         try:
             markets = await self.client.get_markets(active_only=True)
-            self._markets_cache.clear()
-            self._markets_cache.extend(markets)
-            log.info("Markets refreshed: %d active markets", len(markets))
         except Exception as exc:
-            log.error("Failed to refresh markets: %s", exc)
+            log.error("Failed to refresh markets — keeping existing cache (%d): %s",
+                      len(self._markets_cache), exc)
+            return
+
+        if not markets:
+            log.warning(
+                "Market refresh returned 0 markets — keeping existing cache (%d)",
+                len(self._markets_cache),
+            )
+            return
+
+        if len(markets) < config.MIN_MARKETS_THRESHOLD and self._markets_cache:
+            log.warning(
+                "Market refresh returned only %d markets (threshold=%d) — "
+                "keeping existing cache (%d) to avoid safe-mode false positive",
+                len(markets), config.MIN_MARKETS_THRESHOLD, len(self._markets_cache),
+            )
+            return
+
+        self._markets_cache.clear()
+        self._markets_cache.extend(markets)
+        log.info("Markets refreshed: %d active markets", len(markets))
 
     async def _market_refresh_loop(self):
         while self._running:
@@ -151,6 +270,14 @@ class Bot:
         log.info("PriceArb loop starting")
         while self._running:
             try:
+                if not self._safe_to_trade():
+                    log.warning(
+                        "PriceArb: SAFE MODE — market list too small (%d < %d), "
+                        "skipping cycle",
+                        len(self._markets_cache), config.MIN_MARKETS_THRESHOLD,
+                    )
+                    await asyncio.sleep(10)
+                    continue
                 opportunities = await self.price_arb.scan_once()
                 for opp in opportunities:
                     await self.price_arb.execute(opp)
@@ -163,8 +290,43 @@ class Bot:
 
     async def _latency_arb_loop(self):
         log.info("LatencyArb loop starting")
+        _feed_warned = False
         while self._running:
             try:
+                # Safe-mode: market list too small
+                if not self._safe_to_trade():
+                    log.warning(
+                        "LatencyArb: SAFE MODE — market list too small (%d < %d), "
+                        "skipping cycle",
+                        len(self._markets_cache), config.MIN_MARKETS_THRESHOLD,
+                    )
+                    await asyncio.sleep(5)
+                    continue
+
+                # Safe-mode: price feed never started
+                if not self.price_feed.has_price:
+                    if not _feed_warned:
+                        log.warning(
+                            "LatencyArb: SAFE MODE — BTC price feed has no data yet; "
+                            "waiting for Binance/Coinbase connection"
+                        )
+                        _feed_warned = True
+                    await asyncio.sleep(5)
+                    continue
+
+                # Safe-mode: price feed stale (likely disconnected)
+                if self.price_feed.is_stale:
+                    if not _feed_warned:
+                        log.warning(
+                            "LatencyArb: SAFE MODE — BTC price stale (%.0fs > 60s); "
+                            "no new entries until feed recovers",
+                            self.price_feed.age_secs,
+                        )
+                        _feed_warned = True
+                    await asyncio.sleep(5)
+                    continue
+
+                _feed_warned = False
                 trades = await self.latency_arb.scan_once(self._markets_cache)
                 for trade in trades:
                     await self.latency_arb.execute(trade)
@@ -178,6 +340,16 @@ class Bot:
         log.info("MarketMaker loop starting")
         while self._running:
             try:
+                # Safe-mode: market list too small
+                if not self._safe_to_trade():
+                    log.warning(
+                        "MarketMaker: SAFE MODE — market list too small (%d < %d), "
+                        "skipping rebalance",
+                        len(self._markets_cache), config.MIN_MARKETS_THRESHOLD,
+                    )
+                    await asyncio.sleep(config.MM_REBALANCE_INTERVAL)
+                    continue
+
                 # Refresh balance so order sizing stays current
                 if config.DRY_RUN:
                     self.market_maker.set_balance(config.MM_STARTING_BALANCE)

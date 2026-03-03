@@ -9,6 +9,7 @@ import asyncio
 import csv
 import logging
 import os
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -125,7 +126,13 @@ class PolymarketClient:
     async def get_markets(
         self, active_only: bool = True, limit: int = 500
     ) -> list[Market]:
-        """Return a list of markets."""
+        """Return a list of markets, paginating until exhausted.
+
+        If a single page fetch fails after retries, pagination stops and
+        whatever markets have been collected so far are returned (graceful
+        degradation — callers should treat a short list as a warning, not
+        an error).
+        """
         params = {"limit": limit}
         if active_only:
             params["active"] = "true"
@@ -133,12 +140,21 @@ class PolymarketClient:
 
         markets = []
         next_cursor = None
+        page = 0
 
         while True:
+            page += 1
             if next_cursor:
                 params["next_cursor"] = next_cursor
 
-            data = await self._get_json("/markets", params)
+            try:
+                data = await self._get_json("/markets", params)
+            except Exception as exc:
+                log.warning(
+                    "get_markets: page %d fetch failed — returning %d markets collected so far: %s",
+                    page, len(markets), exc,
+                )
+                break   # graceful degrade: don't wipe what we have
 
             for m in data.get("data", []):
                 markets.append(
@@ -217,11 +233,12 @@ class PolymarketClient:
             try:
                 async with self._session.get(path, params=params) as resp:
                     if resp.status in (502, 503, 504) and attempt < max_retries - 1:
+                        jitter = random.uniform(0, delay * 0.3)
                         log.warning(
-                            "HTTP %d on %s — retry %d/%d in %.0fs",
-                            resp.status, path, attempt + 1, max_retries - 1, delay,
+                            "HTTP %d on %s — retry %d/%d in %.1fs",
+                            resp.status, path, attempt + 1, max_retries - 1, delay + jitter,
                         )
-                        await asyncio.sleep(delay)
+                        await asyncio.sleep(delay + jitter)
                         delay *= 2
                         continue
                     resp.raise_for_status()
@@ -230,11 +247,12 @@ class PolymarketClient:
                 raise   # 4xx or exhausted 5xx — propagate to caller
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt < max_retries - 1:
+                    jitter = random.uniform(0, delay * 0.3)
                     log.warning(
-                        "Network error on %s (attempt %d/%d): %s — retrying in %.0fs",
-                        path, attempt + 1, max_retries, exc, delay,
+                        "Network error on %s (attempt %d/%d): %s — retrying in %.1fs",
+                        path, attempt + 1, max_retries, exc, delay + jitter,
                     )
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(delay + jitter)
                     delay *= 2
                     continue
                 raise
