@@ -63,9 +63,10 @@ class HealthState:
             continue
     """
 
-    level:   HealthLevel = HealthLevel.NORMAL
-    reason:  str         = "startup"
-    updated: float       = 0.0   # monotonic timestamp of last update
+    level:            HealthLevel = HealthLevel.NORMAL
+    reason:           str         = "startup"
+    updated:          float       = 0.0    # monotonic timestamp of last update
+    size_multiplier:  float       = 1.0    # set by kill-switch (0.5 = Tier 2)
 
     def set(self, level: HealthLevel, reason: str) -> None:
         """Update health level; logs any transition."""
@@ -107,7 +108,8 @@ class HealthState:
     @property
     def summary(self) -> str:
         age = time.monotonic() - self.updated if self.updated > 0 else -1
+        mult_str = f" size_mult={self.size_multiplier:.1f}" if self.size_multiplier != 1.0 else ""
         return (
             f"level={self.level.name} reason={self.reason!r} "
-            f"updated={age:.0f}s ago"
+            f"updated={age:.0f}s ago{mult_str}"
         )

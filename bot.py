@@ -29,6 +29,7 @@ from execution import ExecutionManager
 from feeds.price_feed import BTCPriceFeed
 from health_state import HealthState, HealthLevel
 from risk import RiskEngine, CircuitBreakerState
+from risk.kill_switch import KillSwitch
 from strategies import PriceArbStrategy, LatencyArbStrategy, MarketMakerStrategy
 
 # ---------------------------------------------------------------------------
@@ -89,6 +90,8 @@ class Bot:
         self.risk_engine   = RiskEngine()
         self.exec_manager  = ExecutionManager(self.client)
         self.trade_logger  = QuantTradeLogger()
+        self.kill_switch   = KillSwitch()
+        self._session_start: float = time.time()
 
         self._markets_cache: list = []
         self._tasks: list[asyncio.Task] = []
@@ -137,6 +140,7 @@ class Bot:
             asyncio.create_task(self._latency_arb_loop(),    name="latency-arb"),
             asyncio.create_task(self._market_maker_loop(),   name="market-maker"),
             asyncio.create_task(self._stats_loop(),          name="stats"),
+            asyncio.create_task(self._kill_switch_loop(),    name="kill-switch"),
             asyncio.create_task(
                 self.exec_manager.run_timeout_loop(interval_secs=30),
                 name="order-timeout",
@@ -340,6 +344,50 @@ class Bot:
             await asyncio.sleep(self.MARKETS_REFRESH_SECS)
             await self._refresh_markets()
 
+    async def _kill_switch_loop(self):
+        """
+        Update kill-switch signals every 10s and apply to health + market maker.
+
+        Feeds:
+          - Price-feed staleness (age_secs)
+          - Drawdown pace (daily loss vs limit over session elapsed hours)
+          - API error rate is fed by client calls (not tracked here centrally yet,
+            but the kill switch handles missing data gracefully with 0% rate)
+        """
+        while self._running:
+            try:
+                # Stale data
+                self.kill_switch.update_stale_secs(
+                    self.price_feed.age_secs if self.price_feed.has_price else 0.0
+                )
+
+                # Drawdown pace
+                elapsed_hours = (time.time() - self._session_start) / 3600.0
+                risk_st = self.risk_engine.state
+                current_loss = max(0.0, -risk_st.daily_pnl)   # loss is positive
+                self.kill_switch.update_drawdown_pace(
+                    current_loss,
+                    config.RISK_DAILY_LOSS_LIMIT,
+                    elapsed_hours,
+                )
+
+                # Apply tier to health and market-maker size
+                self.kill_switch.apply_to_health(self.health)
+                self.market_maker.set_size_multiplier(
+                    self.kill_switch.size_multiplier
+                )
+                self.health.size_multiplier = self.kill_switch.size_multiplier
+
+                ks_tier = self.kill_switch.tier
+                if ks_tier.value >= 2:
+                    log.warning("KillSwitch: %s", self.kill_switch.summary)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.warning("KillSwitch loop error: %s", exc)
+            await asyncio.sleep(10)
+
     # ------------------------------------------------------------------
     # Strategy loops (thin wrappers so we can share markets_cache)
     # ------------------------------------------------------------------
@@ -444,14 +492,20 @@ class Bot:
             await asyncio.sleep(self.STATS_INTERVAL_SECS)
             log.info("STATS\n%s", self._format_stats())
             risk_st = self.risk_engine.state
+            ks_st = self.kill_switch.state
+            fq_st = self.exec_manager.fill_quality_stats()
             perf = {
                 **self.market_maker.stats(),
                 "health": self.health.level.name,
                 "health_reason": self.health.reason,
+                "health_size_multiplier": self.health.size_multiplier,
                 "risk_circuit_breaker": risk_st.circuit_breaker.name,
                 "risk_daily_pnl": risk_st.daily_pnl,
                 "risk_drawdown": risk_st.drawdown,
                 "risk_portfolio_exposure": risk_st.portfolio_exposure,
+                "kill_switch_tier": ks_st.tier.label,
+                "kill_switch_trigger": ks_st.trigger,
+                "fill_quality": fq_st,
                 "quant_mode": config.QUANT_MODE_ENABLED,
             }
             with open("logs/perf.json", "w") as fh:
@@ -462,19 +516,26 @@ class Bot:
         h, r = divmod(uptime, 3600)
         m, s = divmod(r, 60)
         risk_st = self.risk_engine.state
+        ks_st = self.kill_switch.state
+        fq_st = self.exec_manager.fill_quality_stats()
         lines = [
             f"  Uptime:        {h:02d}:{m:02d}:{s:02d}",
             f"  Health:        {self.health.summary}",
+            f"  KillSwitch:    {self.kill_switch.summary}",
             f"  Markets:       {len(self._markets_cache)} active",
             f"  BTC price:     ${self.price_feed.price:,.2f} "
             f"(age {self.price_feed.age_secs:.1f}s)",
             f"  Risk:          {risk_st.summary}",
+            f"  FillQuality:   placed={fq_st['total_placed']} "
+            f"cancelled={fq_st['total_cancelled']} "
+            f"cancel_rate={fq_st['cancel_rate']:.1%} "
+            f"avg_lat={fq_st['avg_latency_ms']:.0f}ms",
             f"  PriceArb:      {self.price_arb.stats()}",
             f"  LatencyArb:    {self.latency_arb.stats()}",
             f"  MarketMaker:   {self.market_maker.stats()}",
         ]
         if config.QUANT_MODE_ENABLED:
-            lines.append(f"  Quant mode:    ACTIVE")
+            lines.append(f"  Quant mode:    ACTIVE  profile={config.PARAM_PROFILE}")
         return "\n".join(lines)
 
 

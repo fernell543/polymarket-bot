@@ -107,6 +107,7 @@ class MarketMakerStrategy:
         self.client = client
         self._positions: dict[str, MMPosition] = {}   # condition_id → position
         self._balance: float = config.MM_STARTING_BALANCE  # updated by bot.py
+        self._size_multiplier: float = 1.0   # set by kill-switch (0.5 = Tier 2)
         # One SignalEngine per YES token (keyed by token_id)
         self._signal_engines: dict[str, SignalEngine] = {}
 
@@ -115,12 +116,25 @@ class MarketMakerStrategy:
         if balance > 0:
             self._balance = balance
 
+    def set_size_multiplier(self, multiplier: float) -> None:
+        """
+        Set the kill-switch size multiplier (0.0–1.0).
+
+        Called by bot.py before each rebalance cycle based on kill-switch tier.
+          1.0 → full size (Tier 0 / 1)
+          0.5 → half size (Tier 2 REDUCE)
+          0.0 → should not reach here (Tier 3 blocks at safe-to-trade level)
+        """
+        self._size_multiplier = max(0.0, min(1.0, multiplier))
+
     def _order_size_usdc(self) -> float:
         """
-        Compute per-order size so total deployed ≤ MM_CAPITAL_PCT of balance.
+        Compute per-order size so total deployed ≤ MM_CAPITAL_PCT of balance,
+        then apply the kill-switch size multiplier.
         Floor at $5 so tiny balances still place valid orders.
         """
         size = self._balance * config.MM_CAPITAL_PCT / (config.MM_TARGET_MARKETS * 4)
+        size *= self._size_multiplier
         return max(5.0, round(size, 2))
 
     # ------------------------------------------------------------------

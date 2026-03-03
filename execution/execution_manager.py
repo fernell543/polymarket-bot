@@ -148,6 +148,11 @@ class ExecutionManager:
         self.client = client
         # order_id → monotonic timestamp of placement
         self._pending: dict[str, float] = {}
+        # Fill-quality counters (reset never — session totals)
+        self._total_placed:   int   = 0
+        self._total_cancelled: int  = 0
+        self._last_latency_ms: float = 0.0
+        self._total_latency_ms: float = 0.0
 
     # ------------------------------------------------------------------
     # Main execute method
@@ -196,7 +201,8 @@ class ExecutionManager:
         # --- Adaptive order type ------------------------------------------
         order_type = choose_order_type(spread, confidence, urgency)
 
-        # --- Place order --------------------------------------------------
+        # --- Place order (with latency tracking) --------------------------
+        _t0 = time.monotonic()
         if order_type == "MARKET":
             placed = await self.client.place_market_order(
                 token_id, side, size_usdc
@@ -206,6 +212,11 @@ class ExecutionManager:
             placed = await self.client.place_limit_order(
                 token_id, side, lp, size_usdc
             )
+        latency_ms = (time.monotonic() - _t0) * 1000.0
+        self._last_latency_ms    = latency_ms
+        self._total_latency_ms  += latency_ms
+        if placed and placed.success:
+            self._total_placed += 1
 
         # Track pending limit orders for timeout management
         if (
@@ -254,12 +265,39 @@ class ExecutionManager:
             if ok:
                 self._pending.pop(oid, None)
                 cancelled.append(oid)
+                self._total_cancelled += 1
 
         return cancelled
 
     def mark_filled(self, order_id: str) -> None:
         """Remove an order from the pending tracker (confirmed filled)."""
         self._pending.pop(order_id, None)
+
+    # ------------------------------------------------------------------
+    # Fill-quality stats
+    # ------------------------------------------------------------------
+
+    def fill_quality_stats(self) -> dict:
+        """
+        Return a snapshot of session-level fill-quality metrics.
+
+        Useful for the stats loop and fill_quality analytics module.
+        """
+        avg_lat = (
+            self._total_latency_ms / self._total_placed
+            if self._total_placed > 0 else 0.0
+        )
+        cancel_rate = (
+            self._total_cancelled / self._total_placed
+            if self._total_placed > 0 else 0.0
+        )
+        return {
+            "total_placed":     self._total_placed,
+            "total_cancelled":  self._total_cancelled,
+            "cancel_rate":      round(cancel_rate, 4),
+            "avg_latency_ms":   round(avg_lat, 2),
+            "last_latency_ms":  round(self._last_latency_ms, 2),
+        }
 
     # ------------------------------------------------------------------
     # Convenience: run timeout cleanup in a loop

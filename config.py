@@ -130,6 +130,40 @@ EXEC_TAKER_SPREAD_THRESHOLD = float(
 EXEC_ORDER_TIMEOUT_SECS = int(os.getenv("EXEC_ORDER_TIMEOUT_SECS", "120"))
 
 
+# ===========================================================================
+# Regime-adaptive parameter profiles
+# ===========================================================================
+
+# Which profile to use: "conservative" | "balanced" | "aggressive" | "auto"
+# "auto" selects the profile based on the detected market regime.
+PARAM_PROFILE = os.getenv("PARAM_PROFILE", "auto")
+
+
+# ===========================================================================
+# Kill-switch escalation tiers
+# ===========================================================================
+# All three signals are checked independently; the worst tier applies.
+#
+# Tier 1 — WARN      : log only, full size
+# Tier 2 — REDUCE    : 50% size reduction
+# Tier 3 — NO_TRADE  : block new entries (escalates health to SAFE_MODE)
+
+# API error rate triggers (fraction of calls in last 60s)
+KS_TIER1_API_ERROR_RATE = float(os.getenv("KS_TIER1_API_ERROR_RATE", "0.20"))
+KS_TIER2_API_ERROR_RATE = float(os.getenv("KS_TIER2_API_ERROR_RATE", "0.40"))
+KS_TIER3_API_ERROR_RATE = float(os.getenv("KS_TIER3_API_ERROR_RATE", "0.60"))
+
+# Price-feed staleness triggers (seconds since last valid price)
+KS_TIER1_STALE_SECS     = float(os.getenv("KS_TIER1_STALE_SECS",  "30.0"))
+KS_TIER2_STALE_SECS     = float(os.getenv("KS_TIER2_STALE_SECS",  "90.0"))
+KS_TIER3_STALE_SECS     = float(os.getenv("KS_TIER3_STALE_SECS", "300.0"))
+
+# Drawdown pace triggers (fraction of daily limit lost per hour)
+KS_TIER1_DD_PACE_PCT    = float(os.getenv("KS_TIER1_DD_PACE_PCT", "0.20"))
+KS_TIER2_DD_PACE_PCT    = float(os.getenv("KS_TIER2_DD_PACE_PCT", "0.50"))
+KS_TIER3_DD_PACE_PCT    = float(os.getenv("KS_TIER3_DD_PACE_PCT", "0.80"))
+
+
 def validate():
     if not PRIVATE_KEY:
         raise ValueError("PRIVATE_KEY not set in .env")

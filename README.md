@@ -78,28 +78,47 @@ All settings can be set as environment variables or in `.env`.
 | `EXEC_TAKER_URGENCY_THRESHOLD` | `0.90` | Use market order if urgency >= this |
 | `EXEC_ORDER_TIMEOUT_SECS` | `120` | Cancel unmatched limit orders after N seconds |
 
+### Performance Pass 2 — Profiles, Kill-Switch, Optimizer
+| Variable | Default | Description |
+|---|---|---|
+| `PARAM_PROFILE` | `auto` | `auto` / `conservative` / `balanced` / `aggressive` — regime-adaptive profile |
+| `KS_TIER1_API_ERROR_RATE` | `0.20` | Kill-switch Tier 1 (warn): API error rate threshold |
+| `KS_TIER2_API_ERROR_RATE` | `0.40` | Kill-switch Tier 2 (reduce 50%): API error rate threshold |
+| `KS_TIER3_API_ERROR_RATE` | `0.60` | Kill-switch Tier 3 (no-trade): API error rate threshold |
+| `KS_TIER1_STALE_SECS` | `30` | Kill-switch Tier 1: price-feed staleness (seconds) |
+| `KS_TIER2_STALE_SECS` | `90` | Kill-switch Tier 2: price-feed staleness (seconds) |
+| `KS_TIER3_STALE_SECS` | `300` | Kill-switch Tier 3: price-feed staleness (seconds) |
+| `KS_TIER1_DD_PACE_PCT` | `0.20` | Kill-switch Tier 1: drawdown pace (fraction of daily limit per hour) |
+| `KS_TIER2_DD_PACE_PCT` | `0.50` | Kill-switch Tier 2: drawdown pace |
+| `KS_TIER3_DD_PACE_PCT` | `0.80` | Kill-switch Tier 3: drawdown pace |
+
 ---
 
 ## Architecture
 
 ```
-bot.py                   — Orchestrator; spawns all async tasks
+bot.py                   — Orchestrator; spawns all async tasks + kill-switch loop
 ├── client.py            — CLOB API wrapper (aiohttp + py-clob-client)
 ├── feeds/price_feed.py  — Binance WS → Coinbase REST BTC/USD feed
 ├── strategies/
 │   ├── price_arb.py     — Price arbitrage
 │   ├── latency_arb.py   — Latency arbitrage
-│   └── market_maker.py  — Market making (signal-engine integrated)
+│   └── market_maker.py  — Market making (signal-engine + kill-switch size gate)
 ├── signals/
 │   └── signal_engine.py — Multi-factor signal: micro + momentum + mean-rev
 ├── risk/
-│   └── risk_engine.py   — Vol-targeting, caps, drawdown/loss circuit breakers
+│   ├── risk_engine.py   — Vol-targeting, caps, drawdown/loss circuit breakers
+│   ├── kill_switch.py   — 3-tier kill switch: API errors / stale data / DD pace
+│   └── param_profiles.py — Conservative / balanced / aggressive regime profiles
 ├── execution/
-│   └── execution_manager.py — Adaptive maker/taker, edge check, timeout mgr
-├── health_state.py      — Bot-wide health level (NORMAL/DEGRADED/SAFE_MODE/CB)
+│   └── execution_manager.py — Adaptive maker/taker, edge check, latency tracking
+├── health_state.py      — Bot-wide health (NORMAL/DEGRADED/SAFE_MODE/CB) + size_multiplier
 └── analytics/
-    ├── trade_logger.py        — Quant trade log (logs/quant_trades.csv)
-    └── performance_report.py  — Performance summary CLI
+    ├── trade_logger.py        — Quant trade log (spread_at_entry, submit_latency_ms)
+    ├── performance_report.py  — Performance summary CLI
+    ├── fill_quality.py        — Fill ratio, cancel ratio, adverse selection CLI
+    ├── param_optimizer.py     — Grid/random search over key params; outputs CSV+JSON
+    └── walk_forward.py        — Window-based overfit + stability validation CLI
 ```
 
 ### Health State Machine
@@ -224,14 +243,111 @@ kill -9 <bot_pid>
 # Default (reads logs/quant_trades.csv):
 python -m analytics.performance_report
 
-# Custom CSV:
-python -m analytics.performance_report --csv logs/quant_trades.csv
-
 # Verbose (trade-by-trade P&L bar chart):
 python -m analytics.performance_report -v
 
+# Fill quality + latency report:
+python -m analytics.fill_quality
+
 # Custom fee/slippage assumptions:
 python -m analytics.performance_report --fee 0.02 --slip 0.003
+```
+
+---
+
+## Daily Tuning Workflow (Paper → Live)
+
+### Tonight — paper collection + analysis
+
+**Step 1: Run paper super mode** (collect paper trades for 2–4+ hours)
+```powershell
+.\run_paper_super.ps1
+# Options: -Profile conservative|balanced|aggressive|auto
+#          -ConfThreshold 0.50 -MinEdge 0.015
+```
+
+**Step 2: Optimize parameters** (after ≥50 trades)
+```powershell
+.\run_paper_optimize.ps1
+# Outputs: logs/opt_results.csv, logs/opt_best.json
+# Options: -Mode random -NSamples 1000 -DdPenalty 1.0
+```
+
+**Step 3: Validate against overfitting**
+```powershell
+.\run_walkforward.ps1
+# Outputs: per-window stats, overfit ratio, stability score
+# Options: -Windows 6 -Verbose
+```
+
+**Step 4: Full analytics pass**
+```bash
+python -m analytics.performance_report
+python -m analytics.fill_quality
+```
+
+---
+
+### Tomorrow — small live gate (only after paper criteria met)
+
+**Small live gate criteria (ALL must pass — no exceptions):**
+- [ ] Stability score ≥ 0.70 (from walk_forward output)
+- [ ] Overfit ratio < 2.0
+- [ ] Val Sharpe ≥ 0.30
+- [ ] Win rate ≥ 52% in validation window
+- [ ] Fill rate ≥ 70% (no excessive cancels)
+- [ ] Adverse selection avg < +0.5% (from fill_quality output)
+- [ ] Zero circuit-breaker trips in paper session
+
+**If all criteria pass, use the Phase 2 live command from the rollout plan below.**
+Do NOT force live if any criterion fails — collect more paper data instead.
+
+---
+
+## Kill-Switch Escalation Tiers
+
+Operates independently of the hard circuit breaker, triggering proportional responses:
+
+| Tier | Label | Action | Trigger |
+|---|---|---|---|
+| 0 | NORMAL | Full size (1.0×) | All signals nominal |
+| 1 | WARN | Full size, log warning | API errors ≥20% or stale ≥30s or DD pace ≥20%/hr |
+| 2 | REDUCE | Half size (0.5×) | API errors ≥40% or stale ≥90s or DD pace ≥50%/hr |
+| 3 | NO-TRADE | Block new entries | API errors ≥60% or stale ≥300s or DD pace ≥80%/hr |
+
+All thresholds are env-configurable: `KS_TIER1_API_ERROR_RATE`, `KS_TIER2_STALE_SECS`, etc.
+
+---
+
+## Regime-Adaptive Parameter Profiles
+
+Three profiles selected automatically by market regime (or forced via `PARAM_PROFILE`):
+
+| Profile | Conf Threshold | Min Edge | MM Spread | Trigger |
+|---|---|---|---|---|
+| `conservative` | 0.55 | 0.018 | 2.5% | regime=unknown |
+| `balanced` | 0.42 | 0.012 | 2.0% | regime=ranging |
+| `aggressive` | 0.32 | 0.008 | 1.5% | regime=trending |
+
+Hard caps from the global risk engine are always enforced.
+
+```bash
+# Force a specific profile:
+PARAM_PROFILE=conservative python bot.py
+
+# Auto-select by regime (default):
+PARAM_PROFILE=auto python bot.py
+```
+
+---
+
+## Running the Performance Report
+
+```bash
+python -m analytics.performance_report
+python -m analytics.performance_report -v
+python -m analytics.fill_quality
+python -m analytics.fill_quality -v
 ```
 
 ---
@@ -244,3 +360,5 @@ python -m analytics.performance_report --fee 0.02 --slip 0.003
 | `logs/orders.csv` | All orders placed (basic client log) |
 | `logs/quant_trades.csv` | Rich quant log with signal + risk reason codes |
 | `logs/perf.json` | Live performance snapshot (written every 60s) |
+| `logs/opt_results.csv` | Parameter optimizer results (ranked configs) |
+| `logs/opt_best.json` | Top-3 configs from last optimizer run |

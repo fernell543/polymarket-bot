@@ -64,6 +64,8 @@ _COLUMNS = [
     "expected_edge",
     "realized_edge",
     "order_type",
+    "spread_at_entry",
+    "submit_latency_ms",
     # Risk state
     "circuit_breaker",
     "daily_pnl",
@@ -99,6 +101,8 @@ class TradeRecord:
     expected_edge:     float = 0.0
     realized_edge:     float = 0.0   # fill in after settlement
     order_type:        str   = "LIMIT"
+    spread_at_entry:   float = 0.0   # bid-ask spread when order was placed
+    submit_latency_ms: float = 0.0   # round-trip API latency in ms
 
     # Risk snapshot at time of trade
     circuit_breaker:   str   = "CLOSED"
@@ -150,6 +154,8 @@ class QuantTradeLogger:
             round(record.expected_edge, 6),
             round(record.realized_edge, 6),
             record.order_type,
+            round(record.spread_at_entry, 6),
+            round(record.submit_latency_ms, 2),
             record.circuit_breaker,
             round(record.daily_pnl, 4),
             round(record.drawdown, 4),
