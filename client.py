@@ -1,0 +1,358 @@
+"""
+Thin async wrapper around Polymarket's CLOB API.
+
+Uses py-clob-client for authentication and order signing,
+and aiohttp for non-blocking HTTP calls.
+"""
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+import aiohttp
+
+import config
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class Market:
+    condition_id: str
+    question: str
+    end_date_iso: str
+    active: bool
+    closed: bool
+    tokens: list[dict]   # [{"token_id": ..., "outcome": "Yes"/"No"}, ...]
+    rewards: Optional[dict] = None
+
+
+@dataclass
+class OrderBook:
+    token_id: str
+    bids: list[tuple[float, float]]  # [(price, size), ...]
+    asks: list[tuple[float, float]]
+
+
+@dataclass
+class PlacedOrder:
+    order_id: str
+    status: str
+    success: bool
+    error: Optional[str] = None
+
+
+class PolymarketClient:
+    """
+    Async Polymarket CLOB client.
+
+    Handles:
+      - Fetching markets and order books (unauthenticated)
+      - Placing / cancelling orders (authenticated via EIP-712)
+    """
+
+    def __init__(self):
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._clob_client = None  # py-clob-client instance
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self):
+        self._session = aiohttp.ClientSession(
+            base_url=config.CLOB_HOST,
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+        self._init_clob_client()
+        log.info("PolymarketClient started (dry_run=%s)", config.DRY_RUN)
+
+    async def stop(self):
+        if self._session:
+            await self._session.close()
+
+    def _init_clob_client(self):
+        """Initialise the signing client from py-clob-client."""
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+
+            self._clob_client = ClobClient(
+                host=config.CLOB_HOST,
+                key=config.PRIVATE_KEY,
+                chain_id=config.POLYGON_CHAIN_ID,
+                signature_type=0,      # EOA wallet
+                funder=config.WALLET_ADDRESS,
+            )
+
+            # Derive L2 API key from wallet signature
+            creds = self._clob_client.create_or_derive_api_creds()
+            self._clob_client.set_api_creds(creds)
+            log.info("Authenticated with Polymarket CLOB API")
+        except ImportError:
+            log.warning(
+                "py-clob-client not installed — order placement disabled. "
+                "Run: pip install py-clob-client"
+            )
+
+    # ------------------------------------------------------------------
+    # Market data (no auth required)
+    # ------------------------------------------------------------------
+
+    async def get_markets(
+        self, active_only: bool = True, limit: int = 500
+    ) -> list[Market]:
+        """Return a list of markets."""
+        params = {"limit": limit}
+        if active_only:
+            params["active"] = "true"
+            params["closed"] = "false"
+
+        markets = []
+        next_cursor = None
+
+        while True:
+            if next_cursor:
+                params["next_cursor"] = next_cursor
+
+            async with self._session.get("/markets", params=params) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+            for m in data.get("data", []):
+                markets.append(
+                    Market(
+                        condition_id=m["condition_id"],
+                        question=m.get("question", ""),
+                        end_date_iso=m.get("end_date_iso", ""),
+                        active=m.get("active", False),
+                        closed=m.get("closed", True),
+                        tokens=m.get("tokens", []),
+                    )
+                )
+
+            next_cursor = data.get("next_cursor")
+            if not next_cursor or next_cursor == "LTE=":
+                break
+
+        return markets
+
+    async def get_order_book(self, token_id: str) -> OrderBook:
+        """Return bids and asks for a single token."""
+        async with self._session.get(
+            "/book", params={"token_id": token_id}
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+        def parse_side(entries):
+            result = []
+            for e in entries or []:
+                try:
+                    result.append((float(e["price"]), float(e["size"])))
+                except (KeyError, ValueError):
+                    pass
+            return result
+
+        return OrderBook(
+            token_id=token_id,
+            bids=parse_side(data.get("bids")),
+            asks=parse_side(data.get("asks")),
+        )
+
+    async def get_best_prices(self, token_id: str) -> tuple[float, float]:
+        """Return (best_bid, best_ask) for a token. Returns (0, 1) on failure."""
+        try:
+            book = await self.get_order_book(token_id)
+            best_bid = max((p for p, _ in book.bids), default=0.0)
+            best_ask = min((p for p, _ in book.asks), default=1.0)
+            return best_bid, best_ask
+        except Exception as exc:
+            log.debug("get_best_prices(%s) failed: %s", token_id, exc)
+            return 0.0, 1.0
+
+    async def get_midpoint(self, token_id: str) -> float:
+        bid, ask = await self.get_best_prices(token_id)
+        return (bid + ask) / 2
+
+    async def get_rewards_markets(self) -> list[dict]:
+        """Return markets currently earning liquidity rewards."""
+        try:
+            async with self._session.get(
+                "/rewards/markets_earning_daily"
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as exc:
+            log.warning("Could not fetch rewards markets: %s", exc)
+            return []
+
+    async def get_balance_usdc(self) -> float:
+        """Return available USDC balance for the wallet."""
+        try:
+            async with self._session.get(
+                "/balance", params={"address": config.WALLET_ADDRESS}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(data.get("balance", 0))
+        except Exception as exc:
+            log.debug("get_balance: %s", exc)
+        return 0.0
+
+    async def get_open_orders(self) -> list[dict]:
+        """Return open orders for this wallet."""
+        try:
+            async with self._session.get(
+                "/orders", params={"maker_address": config.WALLET_ADDRESS}
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception as exc:
+            log.debug("get_open_orders: %s", exc)
+        return []
+
+    # ------------------------------------------------------------------
+    # Order execution (requires auth)
+    # ------------------------------------------------------------------
+
+    async def place_limit_order(
+        self,
+        token_id: str,
+        side: str,       # "BUY" or "SELL"
+        price: float,    # 0.01 – 0.99
+        size_usdc: float,
+    ) -> PlacedOrder:
+        """
+        Place a GTC limit order.
+
+        In dry-run mode the order is logged but never sent.
+        """
+        size_shares = round(size_usdc / price, 4)
+        log.info(
+            "[ORDER] %s %s @ %.4f  (%.2f USDC = %.4f shares) dry=%s",
+            side, token_id[:8], price, size_usdc, size_shares, config.DRY_RUN,
+        )
+
+        if config.DRY_RUN:
+            return PlacedOrder(
+                order_id="DRY-RUN", status="simulated", success=True
+            )
+
+        if self._clob_client is None:
+            return PlacedOrder(
+                order_id="", status="error", success=False,
+                error="CLOB client not initialised",
+            )
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType, Side
+
+            py_side = Side.BUY if side == "BUY" else Side.SELL
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=round(price, 4),
+                size=size_shares,
+                side=py_side,
+            )
+            signed = self._clob_client.create_order(order_args)
+            resp = self._clob_client.post_order(signed, OrderType.GTC)
+
+            success = resp.get("success", False)
+            return PlacedOrder(
+                order_id=resp.get("orderID", ""),
+                status=resp.get("status", "unknown"),
+                success=success,
+                error=None if success else str(resp),
+            )
+        except Exception as exc:
+            log.error("place_limit_order failed: %s", exc)
+            return PlacedOrder(order_id="", status="error", success=False, error=str(exc))
+
+    async def place_market_order(
+        self,
+        token_id: str,
+        side: str,
+        size_usdc: float,
+    ) -> PlacedOrder:
+        """Place a market (FOK) order. Uses best ask/bid as price limit."""
+        bid, ask = await self.get_best_prices(token_id)
+        price = ask if side == "BUY" else bid
+
+        if price <= 0 or price >= 1:
+            return PlacedOrder(
+                order_id="", status="error", success=False,
+                error=f"No liquidity for market order (bid={bid}, ask={ask})"
+            )
+
+        log.info(
+            "[MARKET] %s %s @ market (%.4f)  %.2f USDC dry=%s",
+            side, token_id[:8], price, size_usdc, config.DRY_RUN,
+        )
+
+        if config.DRY_RUN:
+            return PlacedOrder(order_id="DRY-RUN", status="simulated", success=True)
+
+        if self._clob_client is None:
+            return PlacedOrder(
+                order_id="", status="error", success=False,
+                error="CLOB client not initialised",
+            )
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType, Side
+
+            py_side = Side.BUY if side == "BUY" else Side.SELL
+            size_shares = round(size_usdc / price, 4)
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=round(price, 4),
+                size=size_shares,
+                side=py_side,
+            )
+            signed = self._clob_client.create_order(order_args)
+            resp = self._clob_client.post_order(signed, OrderType.FOK)
+
+            success = resp.get("success", False)
+            return PlacedOrder(
+                order_id=resp.get("orderID", ""),
+                status=resp.get("status", "unknown"),
+                success=success,
+                error=None if success else str(resp),
+            )
+        except Exception as exc:
+            log.error("place_market_order failed: %s", exc)
+            return PlacedOrder(order_id="", status="error", success=False, error=str(exc))
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order by ID."""
+        if config.DRY_RUN:
+            log.info("[CANCEL] %s (dry run)", order_id)
+            return True
+
+        if self._clob_client is None:
+            return False
+
+        try:
+            self._clob_client.cancel(order_id)
+            return True
+        except Exception as exc:
+            log.error("cancel_order(%s) failed: %s", order_id, exc)
+            return False
+
+    async def cancel_all_orders(self) -> bool:
+        """Cancel all open orders for this wallet."""
+        if config.DRY_RUN:
+            log.info("[CANCEL ALL] (dry run)")
+            return True
+
+        if self._clob_client is None:
+            return False
+
+        try:
+            self._clob_client.cancel_all()
+            return True
+        except Exception as exc:
+            log.error("cancel_all_orders failed: %s", exc)
+            return False
