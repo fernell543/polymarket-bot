@@ -23,8 +23,12 @@ import time
 from typing import Optional
 
 import config
+from analytics import QuantTradeLogger
 from client import PolymarketClient
+from execution import ExecutionManager
 from feeds.price_feed import BTCPriceFeed
+from health_state import HealthState, HealthLevel
+from risk import RiskEngine, CircuitBreakerState
 from strategies import PriceArbStrategy, LatencyArbStrategy, MarketMakerStrategy
 
 # ---------------------------------------------------------------------------
@@ -80,6 +84,12 @@ class Bot:
         self.latency_arb  = LatencyArbStrategy(self.client, self.price_feed)
         self.market_maker = MarketMakerStrategy(self.client)
 
+        # --- Quant infrastructure (safe when QUANT_MODE_ENABLED=0) --------
+        self.health        = HealthState()
+        self.risk_engine   = RiskEngine()
+        self.exec_manager  = ExecutionManager(self.client)
+        self.trade_logger  = QuantTradeLogger()
+
         self._markets_cache: list = []
         self._tasks: list[asyncio.Task] = []
         self._running = False
@@ -127,7 +137,16 @@ class Bot:
             asyncio.create_task(self._latency_arb_loop(),    name="latency-arb"),
             asyncio.create_task(self._market_maker_loop(),   name="market-maker"),
             asyncio.create_task(self._stats_loop(),          name="stats"),
+            asyncio.create_task(
+                self.exec_manager.run_timeout_loop(interval_secs=30),
+                name="order-timeout",
+            ),
         ]
+
+        if config.QUANT_MODE_ENABLED:
+            log.info("QUANT MODE ENABLED — signal engine, risk engine, adaptive execution active")
+        else:
+            log.info("Quant mode disabled (QUANT_MODE_ENABLED=0) — running classic strategies")
 
         log.info("Bot started with %d tasks", len(self._tasks))
 
@@ -175,13 +194,16 @@ class Bot:
         else:
             log.info("  [SKIP] Env-var check (DRY_RUN mode)")
 
-        # 2. API connectivity
+        # 2. API connectivity — single-page probe only (avoids 500k-market pagination)
         try:
-            test = await self.client.get_markets(active_only=True, limit=1)
-            if test:
-                log.info("  [OK]   CLOB API reachable (%d market returned)", len(test))
+            probe = await self.client._get_json(
+                "/markets", {"active": "true", "closed": "false", "limit": "10"}
+            )
+            n = len(probe.get("data", []))
+            if n > 0:
+                log.info("  [OK]   CLOB API reachable (%d markets on probe page)", n)
             else:
-                log.warning("  [WARN] CLOB API reachable but returned 0 markets")
+                log.warning("  [WARN] CLOB API reachable but probe returned 0 markets")
         except Exception as exc:
             log.error("  [FAIL] Cannot reach CLOB API: %s", exc)
             log.error("         Check CLOB_HOST in .env and network connectivity")
@@ -208,17 +230,77 @@ class Bot:
         return ok
 
     # ------------------------------------------------------------------
+    # Health state management
+    # ------------------------------------------------------------------
+
+    def _update_health_state(self) -> None:
+        """
+        Recompute and apply the global HealthState from current data quality
+        signals and the risk engine's circuit-breaker.
+
+        Called after every market refresh and inside strategy loops.
+        """
+        # Risk engine circuit breaker → highest severity
+        cb = self.risk_engine.state.circuit_breaker
+        if cb == CircuitBreakerState.OPEN:
+            self.health.set(
+                HealthLevel.CIRCUIT_BREAKER,
+                f"risk circuit breaker OPEN — "
+                f"daily_pnl={self.risk_engine.state.daily_pnl:+.2f} "
+                f"drawdown={self.risk_engine.state.drawdown:.2f}",
+            )
+            return
+
+        # Market list too small → SAFE_MODE
+        if len(self._markets_cache) < config.MIN_MARKETS_THRESHOLD:
+            self.health.set(
+                HealthLevel.SAFE_MODE,
+                f"market list too small: {len(self._markets_cache)} < "
+                f"{config.MIN_MARKETS_THRESHOLD}",
+            )
+            return
+
+        # BTC price feed completely absent → SAFE_MODE
+        if not self.price_feed.has_price:
+            self.health.set(
+                HealthLevel.SAFE_MODE,
+                "BTC price feed has no data yet",
+            )
+            return
+
+        # BTC price feed stale → SAFE_MODE (latency_arb) / DEGRADED (others)
+        if self.price_feed.is_stale:
+            self.health.set(
+                HealthLevel.SAFE_MODE,
+                f"BTC price stale ({self.price_feed.age_secs:.0f}s > 60s)",
+            )
+            return
+
+        # Cooldown: temporary pause, not a hard stop
+        if cb == CircuitBreakerState.COOLING:
+            self.health.set(
+                HealthLevel.SAFE_MODE,
+                f"risk cooldown active ({self.risk_engine.state.consecutive_losses} "
+                f"consecutive losses)",
+            )
+            return
+
+        # All clear
+        self.health.set(HealthLevel.NORMAL, "all systems operational")
+
+    # ------------------------------------------------------------------
     # Safe-mode guard
     # ------------------------------------------------------------------
 
     def _safe_to_trade(self) -> bool:
-        """Return True only when data confidence is sufficient for new entries.
+        """Return True only when data quality and risk state allow new entries.
 
-        False when:
-          - Market list is smaller than MIN_MARKETS_THRESHOLD (API degraded).
-          - (Price-feed staleness is checked separately per-strategy loop.)
+        Checks:
+          - Market list >= MIN_MARKETS_THRESHOLD.
+          - HealthState == NORMAL (price feed fresh, no circuit breaker).
         """
-        return len(self._markets_cache) >= config.MIN_MARKETS_THRESHOLD
+        self._update_health_state()
+        return self.health.ok_to_trade()
 
     # ------------------------------------------------------------------
     # Shared market cache
@@ -271,11 +353,12 @@ class Bot:
         while self._running:
             try:
                 if not self._safe_to_trade():
-                    log.warning(
-                        "PriceArb: SAFE MODE — market list too small (%d < %d), "
-                        "skipping cycle",
-                        len(self._markets_cache), config.MIN_MARKETS_THRESHOLD,
-                    )
+                    log.warning("PriceArb: %s", self.health.summary)
+                    await asyncio.sleep(10)
+                    continue
+                if not self.risk_engine.can_trade():
+                    log.warning("PriceArb: risk engine blocked — %s",
+                                self.risk_engine.state.summary)
                     await asyncio.sleep(10)
                     continue
                 opportunities = await self.price_arb.scan_once()
@@ -290,43 +373,20 @@ class Bot:
 
     async def _latency_arb_loop(self):
         log.info("LatencyArb loop starting")
-        _feed_warned = False
         while self._running:
             try:
-                # Safe-mode: market list too small
+                # Unified safe-mode check (covers market list + price feed + CB)
                 if not self._safe_to_trade():
-                    log.warning(
-                        "LatencyArb: SAFE MODE — market list too small (%d < %d), "
-                        "skipping cycle",
-                        len(self._markets_cache), config.MIN_MARKETS_THRESHOLD,
-                    )
+                    log.warning("LatencyArb: %s", self.health.summary)
                     await asyncio.sleep(5)
                     continue
 
-                # Safe-mode: price feed never started
-                if not self.price_feed.has_price:
-                    if not _feed_warned:
-                        log.warning(
-                            "LatencyArb: SAFE MODE — BTC price feed has no data yet; "
-                            "waiting for Binance/Coinbase connection"
-                        )
-                        _feed_warned = True
+                if not self.risk_engine.can_trade():
+                    log.warning("LatencyArb: risk engine blocked — %s",
+                                self.risk_engine.state.summary)
                     await asyncio.sleep(5)
                     continue
 
-                # Safe-mode: price feed stale (likely disconnected)
-                if self.price_feed.is_stale:
-                    if not _feed_warned:
-                        log.warning(
-                            "LatencyArb: SAFE MODE — BTC price stale (%.0fs > 60s); "
-                            "no new entries until feed recovers",
-                            self.price_feed.age_secs,
-                        )
-                        _feed_warned = True
-                    await asyncio.sleep(5)
-                    continue
-
-                _feed_warned = False
                 trades = await self.latency_arb.scan_once(self._markets_cache)
                 for trade in trades:
                     await self.latency_arb.execute(trade)
@@ -340,13 +400,15 @@ class Bot:
         log.info("MarketMaker loop starting")
         while self._running:
             try:
-                # Safe-mode: market list too small
+                # Unified safe-mode check
                 if not self._safe_to_trade():
-                    log.warning(
-                        "MarketMaker: SAFE MODE — market list too small (%d < %d), "
-                        "skipping rebalance",
-                        len(self._markets_cache), config.MIN_MARKETS_THRESHOLD,
-                    )
+                    log.warning("MarketMaker: %s", self.health.summary)
+                    await asyncio.sleep(config.MM_REBALANCE_INTERVAL)
+                    continue
+
+                # Risk engine check (MM is maintenance-allowed even in cooldown)
+                if not self.health.maintenance_allowed():
+                    log.warning("MarketMaker: circuit breaker OPEN — skipping rebalance")
                     await asyncio.sleep(config.MM_REBALANCE_INTERVAL)
                     continue
 
@@ -381,22 +443,38 @@ class Bot:
         while self._running:
             await asyncio.sleep(self.STATS_INTERVAL_SECS)
             log.info("STATS\n%s", self._format_stats())
+            risk_st = self.risk_engine.state
+            perf = {
+                **self.market_maker.stats(),
+                "health": self.health.level.name,
+                "health_reason": self.health.reason,
+                "risk_circuit_breaker": risk_st.circuit_breaker.name,
+                "risk_daily_pnl": risk_st.daily_pnl,
+                "risk_drawdown": risk_st.drawdown,
+                "risk_portfolio_exposure": risk_st.portfolio_exposure,
+                "quant_mode": config.QUANT_MODE_ENABLED,
+            }
             with open("logs/perf.json", "w") as fh:
-                json.dump(self.market_maker.stats(), fh)
+                json.dump(perf, fh, indent=2)
 
     def _format_stats(self) -> str:
         uptime = int(time.monotonic() - self._start_time)
         h, r = divmod(uptime, 3600)
         m, s = divmod(r, 60)
+        risk_st = self.risk_engine.state
         lines = [
             f"  Uptime:        {h:02d}:{m:02d}:{s:02d}",
+            f"  Health:        {self.health.summary}",
             f"  Markets:       {len(self._markets_cache)} active",
             f"  BTC price:     ${self.price_feed.price:,.2f} "
             f"(age {self.price_feed.age_secs:.1f}s)",
+            f"  Risk:          {risk_st.summary}",
             f"  PriceArb:      {self.price_arb.stats()}",
             f"  LatencyArb:    {self.latency_arb.stats()}",
             f"  MarketMaker:   {self.market_maker.stats()}",
         ]
+        if config.QUANT_MODE_ENABLED:
+            lines.append(f"  Quant mode:    ACTIVE")
         return "\n".join(lines)
 
 

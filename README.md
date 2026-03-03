@@ -1,7 +1,7 @@
-# polymarket-bot
+# Polymarket Bot
 
-An async Python trading bot for [Polymarket](https://polymarket.com) using the CLOB API.
-Runs three concurrent strategies: price arbitrage, latency arbitrage, and market making.
+An async Python trading bot for [Polymarket](https://polymarket.com) with three
+concurrent strategies and a layered quant upgrade system.
 
 ---
 
@@ -9,116 +9,230 @@ Runs three concurrent strategies: price arbitrage, latency arbitrage, and market
 
 | Strategy | Description |
 |---|---|
-| **PriceArb** | Buys YES+NO when combined price < $1.00 (risk-free arb) |
-| **LatencyArb** | Enters near-certain BTC threshold markets in the final 60 s |
-| **MarketMaker** | Posts two-sided quotes on reward-earning markets to earn spread + DAILY rewards |
+| **PriceArb** | Buys YES + NO when combined cost < $1.00 − fees. Guaranteed locked profit. |
+| **LatencyArb** | Near-expiry BTC threshold markets: enter when spot clearly exceeds threshold. |
+| **MarketMaker** | Two-sided quotes on reward-earning markets; earns spread + liquidity rewards. |
 
 ---
 
-## Quick start
+## Quick Start
 
 ```bash
-cp .env.example .env          # fill in PRIVATE_KEY + WALLET_ADDRESS
+# 1. Install dependencies
 pip install -r requirements.txt
-python bot.py                 # DRY_RUN=1 by default — safe to run immediately
-```
 
-Set `DRY_RUN=0` in `.env` only when you are ready to trade with real funds.
+# 2. Copy and fill environment file
+cp .env.example .env
+# Edit .env: set PRIVATE_KEY, WALLET_ADDRESS
+
+# 3. Paper run (safe default — DRY_RUN=1)
+python bot.py
+
+# 4. Live trading
+DRY_RUN=0 python bot.py
+```
 
 ---
 
-## Configuration (`.env`)
+## Configuration Reference
 
+All settings can be set as environment variables or in `.env`.
+
+### Core
 | Variable | Default | Description |
 |---|---|---|
-| `PRIVATE_KEY` | — | Wallet private key (required for live trading) |
-| `WALLET_ADDRESS` | — | Polygon wallet address |
-| `DRY_RUN` | `1` | `1` = simulate orders only, `0` = live trading |
-| `CLOB_HOST` | `https://clob.polymarket.com` | CLOB API base URL |
-| `MAX_POSITION_USDC` | `500` | Maximum single position size |
-| `MM_CAPITAL_PCT` | `0.20` | Fraction of balance deployed across MM orders |
-| `MM_STARTING_BALANCE` | `5000` | Simulated balance for dry-run sizing |
-| `MM_TARGET_MARKETS` | `5` | Number of markets to quote simultaneously |
-| `MM_REBALANCE_INTERVAL` | `30` | Seconds between MM quote refreshes |
-| `MARKET_MAKER_SPREAD` | `0.02` | Quoted bid-ask spread (2 %) |
-| `ARB_MIN_PROFIT_PCT` | `0.03` | Minimum expected profit for price arb |
-| `LATENCY_ARB_WINDOW_SECS` | `60` | Seconds-to-expiry window for latency arb entry |
-| `LATENCY_ARB_MIN_DISCOUNT` | `0.05` | Minimum price discount vs fair value |
-| `MIN_MARKETS_THRESHOLD` | `10` | Bot enters safe mode when fewer markets are available |
+| `DRY_RUN` | `1` | `1` = paper mode (no real orders); `0` = live |
+| `PRIVATE_KEY` | — | Ethereum private key (live mode only) |
+| `WALLET_ADDRESS` | — | Polygon wallet address (live mode only) |
+| `MAX_POSITION_USDC` | `500` | Hard cap per order in USDC |
+| `MIN_MARKETS_THRESHOLD` | `10` | Minimum market count before safe-mode engages |
 
----
-
-## Live safety checklist
-
-Run through this list **before** setting `DRY_RUN=0`:
-
-- [ ] Bot has run in `DRY_RUN=1` for at least one full session without errors
-- [ ] `logs/bot.log` shows "All health checks passed" on startup
-- [ ] `logs/orders.csv` from dry run looks correct (prices, sizes, sides)
-- [ ] `PRIVATE_KEY` is an EOA wallet key (not a seed phrase)
-- [ ] `WALLET_ADDRESS` matches the key (verify with `eth_account`)
-- [ ] Wallet has USDC deposited on Polygon and approved for the CLOB contract
-- [ ] `MAX_POSITION_USDC` is set to an amount you are comfortable losing entirely
-- [ ] `MM_CAPITAL_PCT` × balance is within risk tolerance
-- [ ] You understand Polymarket's 2 % fee on winnings (`POLYMARKET_FEE = 0.02`)
-- [ ] You have reviewed the latency arb window — markets resolve in real-time; a single flip in BTC price near threshold can cause a full loss
-- [ ] Log rotation is configured (`logs/bot.log` rotates at 5 MB × 5 backups)
-- [ ] You have a plan to stop the bot quickly (Ctrl-C or `kill <pid>`)
-
----
-
-## Startup health checks
-
-On every startup the bot runs three checks and prints results to the log:
-
-```
-============================================================
-  STARTUP HEALTH CHECKS
-============================================================
-  [OK]   PRIVATE_KEY present
-  [OK]   WALLET_ADDRESS present
-  [OK]   CLOB API reachable (1 market returned)
-  [OK]   Auth client initialised
-  All health checks passed — bot starting
-============================================================
-```
-
-In **live mode**, a `[FAIL]` on any check aborts startup immediately.
-In **dry-run mode**, failures print as warnings and the bot continues (so you can test connectivity without keys).
-
----
-
-## Safe mode
-
-The bot automatically suspends **new position entries** (while keeping the loop alive) when data confidence is low:
-
-| Condition | Strategies paused | Recovery |
+### Strategy Parameters
+| Variable | Default | Description |
 |---|---|---|
-| Market list < `MIN_MARKETS_THRESHOLD` | All three | Automatic — next successful market refresh |
-| BTC price feed has no data | LatencyArb | Automatic — when Binance/Coinbase connect |
-| BTC price feed stale (> 60 s) | LatencyArb | Automatic — when feed recovers |
+| `ARB_MIN_PROFIT_PCT` | `0.03` | Minimum net profit % for price-arb to trigger |
+| `MARKET_MAKER_SPREAD` | `0.02` | MM quote spread (2%) |
+| `MM_CAPITAL_PCT` | `0.20` | Fraction of balance deployed in MM orders |
+| `MM_TARGET_MARKETS` | `5` | How many reward markets to quote simultaneously |
+| `LATENCY_ARB_WINDOW_SECS` | `60` | Enter latency-arb within N seconds of expiry |
+| `LATENCY_ARB_MIN_DISCOUNT` | `0.05` | Min price discount vs fair value |
 
-Safe-mode events are logged at `WARNING` level:
+### Quant Mode
+| Variable | Default | Description |
+|---|---|---|
+| `QUANT_MODE_ENABLED` | `0` | **Master switch** — set `1` to enable all quant logic |
+| `SIGNAL_CONFIDENCE_THRESHOLD` | `0.40` | Minimum signal confidence to open a new position |
+| `SIGNAL_WEIGHT_MICRO` | `0.30` | Weight: order-book microstructure factor |
+| `SIGNAL_WEIGHT_MOMENTUM` | `0.35` | Weight: short-horizon momentum factor |
+| `SIGNAL_WEIGHT_MEAN_REV` | `0.35` | Weight: mean-reversion z-score factor |
+| `REGIME_HIGH_VOL_THRESHOLD` | `0.02` | Rolling vol/mean ratio above this → trending regime |
+| `RISK_TARGET_VOL` | `0.05` | Vol-targeting: target daily vol fraction |
+| `RISK_MAX_MARKET_EXPOSURE` | `200` | Max USDC per single market |
+| `RISK_MAX_PORTFOLIO_EXPOSURE` | `1000` | Max total USDC deployed |
+| `RISK_DAILY_LOSS_LIMIT` | `100` | Circuit breaker: max daily loss (USDC) |
+| `RISK_MAX_DRAWDOWN` | `200` | Circuit breaker: max session drawdown (USDC) |
+| `RISK_MAX_CONSECUTIVE_LOSSES` | `3` | After N losses → cooldown pause |
+| `RISK_COOLDOWN_SECS` | `300` | Cooldown duration (seconds) |
+| `EXEC_MIN_EDGE` | `0.010` | Min net edge (after fees+slippage) to place order |
+| `EXEC_TAKER_CONFIDENCE_THRESHOLD` | `0.80` | Use market order if signal confidence >= this |
+| `EXEC_TAKER_URGENCY_THRESHOLD` | `0.90` | Use market order if urgency >= this |
+| `EXEC_ORDER_TIMEOUT_SECS` | `120` | Cancel unmatched limit orders after N seconds |
+
+---
+
+## Architecture
+
 ```
-LatencyArb: SAFE MODE — BTC price stale (73.2s > 60s); no new entries until feed recovers
-MarketMaker: SAFE MODE — market list too small (3 < 10), skipping rebalance
+bot.py                   — Orchestrator; spawns all async tasks
+├── client.py            — CLOB API wrapper (aiohttp + py-clob-client)
+├── feeds/price_feed.py  — Binance WS → Coinbase REST BTC/USD feed
+├── strategies/
+│   ├── price_arb.py     — Price arbitrage
+│   ├── latency_arb.py   — Latency arbitrage
+│   └── market_maker.py  — Market making (signal-engine integrated)
+├── signals/
+│   └── signal_engine.py — Multi-factor signal: micro + momentum + mean-rev
+├── risk/
+│   └── risk_engine.py   — Vol-targeting, caps, drawdown/loss circuit breakers
+├── execution/
+│   └── execution_manager.py — Adaptive maker/taker, edge check, timeout mgr
+├── health_state.py      — Bot-wide health level (NORMAL/DEGRADED/SAFE_MODE/CB)
+└── analytics/
+    ├── trade_logger.py        — Quant trade log (logs/quant_trades.csv)
+    └── performance_report.py  — Performance summary CLI
+```
+
+### Health State Machine
+
+```
+NORMAL -> DEGRADED -> SAFE_MODE -> CIRCUIT_BREAKER
+                                        |
+                              (manual restart required)
+```
+
+| Level | New Trades | Maintenance (cancel/requote) |
+|---|---|---|
+| `NORMAL` | Yes | Yes |
+| `DEGRADED` | Conservative | Yes |
+| `SAFE_MODE` | No | Yes |
+| `CIRCUIT_BREAKER` | No | No |
+
+Safe-mode triggers: market list < threshold, price feed stale, risk cooldown active.
+Circuit-breaker triggers: daily loss > limit OR drawdown > max.
+
+---
+
+## Quant Mode Rollout Plan
+
+### Phase 1 — Paper-Only Validation (minimum 5 days)
+
+**Goal**: Validate signal quality and risk parameters with zero real capital.
+
+```bash
+# Phase 1 paper command (copy/paste ready)
+QUANT_MODE_ENABLED=1 \
+SIGNAL_CONFIDENCE_THRESHOLD=0.50 \
+RISK_DAILY_LOSS_LIMIT=50 \
+RISK_MAX_DRAWDOWN=100 \
+python bot.py
+```
+
+**Collect metrics** after running:
+```bash
+python -m analytics.performance_report
+```
+
+**Phase 1 pass criteria** (all must be met before proceeding):
+- [ ] Win rate >= 52% across >= 100 simulated trades
+- [ ] Average expected edge >= 0.015 (1.5%)
+- [ ] Sharpe-like ratio >= 0.5
+- [ ] Max simulated drawdown <= 20% of paper starting balance
+- [ ] Zero crashes or data-integrity incidents over 5 days
+- [ ] Signal regime not stuck in "unknown" > 30% of trades
+
+---
+
+### Phase 2 — Small Live Caps (after Phase 1 passes)
+
+**Goal**: Validate live execution, fee costs, and fill rates with minimal risk.
+
+```bash
+# Phase 2 live command — small caps
+DRY_RUN=0 \
+QUANT_MODE_ENABLED=1 \
+MAX_POSITION_USDC=25 \
+MM_CAPITAL_PCT=0.05 \
+RISK_MAX_MARKET_EXPOSURE=50 \
+RISK_MAX_PORTFOLIO_EXPOSURE=150 \
+RISK_DAILY_LOSS_LIMIT=25 \
+RISK_MAX_DRAWDOWN=50 \
+SIGNAL_CONFIDENCE_THRESHOLD=0.50 \
+python bot.py
+```
+
+**Phase 2 pass criteria** (minimum 10 live days):
+- [ ] Realized edge >= 80% of expected edge (fill quality)
+- [ ] Live win rate within 5 pp of paper win rate
+- [ ] No circuit-breaker trips in first 5 days
+- [ ] Net PnL positive after fees/slippage on rolling 7-day window
+
+---
+
+### Phase 3 — Scale Conditions
+
+**Goal**: Increase position sizing after Phase 2 metrics are sustained for 30 days.
+
+**Hard prerequisites**:
+- [ ] Phase 2 metrics sustained >= 30 consecutive live days
+- [ ] Live Sharpe-like ratio >= 0.6
+- [ ] Max live drawdown <= 15% of deployed capital
+- [ ] No unhandled exceptions or stale-data incidents
+
+**Incremental scale steps** (only one step per week, monitor after each):
+1. `MAX_POSITION_USDC=50`, `RISK_MAX_PORTFOLIO_EXPOSURE=300`
+2. `MAX_POSITION_USDC=100`, `RISK_MAX_PORTFOLIO_EXPOSURE=600`
+3. `MAX_POSITION_USDC=200`, `RISK_MAX_PORTFOLIO_EXPOSURE=1000`
+
+---
+
+### Kill-Switch Checklist
+
+Stop the bot immediately if **any** of the following occur:
+
+- [ ] Daily P&L < -`RISK_DAILY_LOSS_LIMIT` (circuit breaker should auto-fire)
+- [ ] Session drawdown > `RISK_MAX_DRAWDOWN` (circuit breaker should auto-fire)
+- [ ] BTC price feed offline > 5 minutes (bot enters SAFE_MODE automatically)
+- [ ] Market cache < 10 markets for > 2 consecutive refresh cycles
+- [ ] Any unhandled exception in live order placement
+- [ ] Realized edge < 40% of expected edge over a 20-trade rolling window
+- [ ] External event: Polymarket API changes, UMA oracle incident, network outage
+
+**Manual kill** (Ctrl+C gracefully cancels all open orders):
+```bash
+# Graceful shutdown — cancels all open orders:
+Ctrl+C
+
+# Immediate force-kill (skips cancel — manually cancel via Polymarket UI after):
+kill -9 <bot_pid>
 ```
 
 ---
 
-## Expected failure modes
+## Running the Performance Report
 
-| Symptom | Root cause | What the bot does |
-|---|---|---|
-| HTTP 502 on `/markets` | Transient Polymarket gateway error | Retries up to 3× with exponential backoff + jitter; keeps existing cache |
-| `/markets` returns partial page | Mid-pagination network error | Stops pagination, returns markets collected so far; cache preserved if result is small |
-| `/rewards/markets_earning_daily` → 405 | Endpoint not available in this environment | Latched disabled on first hit — no further calls or log spam |
-| Binance WebSocket drops | Network blip | Reconnects automatically in 3 s; REST fallback available via `fetch_once()` |
-| BTC price stale > 60 s | Extended feed outage | LatencyArb enters safe mode; MarketMaker and PriceArb unaffected |
-| `get_balance_usdc` fails | API error | MarketMaker retains last known balance; logs at DEBUG level |
-| `place_limit_order` fails | Auth error / bad params | Returns `PlacedOrder(success=False)`; logged at ERROR; bot continues |
-| Startup: CLOB API unreachable | Network / DNS issue | Health check fails → live mode aborts; dry-run continues with warning |
-| Startup: missing `PRIVATE_KEY` | `.env` not configured | Health check fails → live mode aborts with actionable error message |
+```bash
+# Default (reads logs/quant_trades.csv):
+python -m analytics.performance_report
+
+# Custom CSV:
+python -m analytics.performance_report --csv logs/quant_trades.csv
+
+# Verbose (trade-by-trade P&L bar chart):
+python -m analytics.performance_report -v
+
+# Custom fee/slippage assumptions:
+python -m analytics.performance_report --fee 0.02 --slip 0.003
+```
 
 ---
 
@@ -126,6 +240,7 @@ MarketMaker: SAFE MODE — market list too small (3 < 10), skipping rebalance
 
 | File | Contents |
 |---|---|
-| `logs/bot.log` | All log output (rotates at 5 MB, 5 backups) |
-| `logs/orders.csv` | Every order attempt (real and simulated) |
-| `logs/perf.json` | MarketMaker stats snapshot (updated every 60 s) |
+| `logs/bot.log` | Rotating main log (5 MB x 5 files) |
+| `logs/orders.csv` | All orders placed (basic client log) |
+| `logs/quant_trades.csv` | Rich quant log with signal + risk reason codes |
+| `logs/perf.json` | Live performance snapshot (written every 60s) |

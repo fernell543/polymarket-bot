@@ -38,6 +38,7 @@ from typing import Optional
 
 import config
 from client import PolymarketClient, Market
+from signals import SignalEngine, SignalResult
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +107,8 @@ class MarketMakerStrategy:
         self.client = client
         self._positions: dict[str, MMPosition] = {}   # condition_id → position
         self._balance: float = config.MM_STARTING_BALANCE  # updated by bot.py
+        # One SignalEngine per YES token (keyed by token_id)
+        self._signal_engines: dict[str, SignalEngine] = {}
 
     def set_balance(self, balance: float) -> None:
         """Called by the orchestrator whenever a fresh balance is fetched."""
@@ -182,8 +185,15 @@ class MarketMakerStrategy:
         """Place or refresh quotes on a single market."""
         condition_id = market.condition_id
 
-        # Get current midpoint
-        yes_bid, yes_ask = await self.client.get_best_prices(yes_id)
+        # Get full order book (needed for signal engine when quant mode active)
+        try:
+            book = await self.client.get_order_book(yes_id)
+            yes_bid = max((p for p, _ in book.bids), default=0.0)
+            yes_ask = min((p for p, _ in book.asks), default=1.0)
+        except Exception:
+            yes_bid, yes_ask = await self.client.get_best_prices(yes_id)
+            book = None
+
         mid = (yes_bid + yes_ask) / 2
 
         # Skip if price is too extreme (don't make markets near resolution)
@@ -191,6 +201,28 @@ class MarketMakerStrategy:
             log.debug("MarketMaker: skipping %s (mid=%.3f too extreme)", condition_id[:8], mid)
             await self._cancel_position(condition_id)
             return
+
+        # --- Signal-engine gate (QUANT_MODE_ENABLED only) ------------------
+        # When active, compute a confidence score from the order book.
+        # If confidence is too low (market is noisy/uncertain), skip this cycle.
+        signal: Optional[SignalResult] = None
+        if config.QUANT_MODE_ENABLED:
+            if yes_id not in self._signal_engines:
+                self._signal_engines[yes_id] = SignalEngine(yes_id)
+            eng = self._signal_engines[yes_id]
+            bids = book.bids if book else []
+            asks = book.asks if book else []
+            signal = eng.evaluate(yes_bid, yes_ask, bids, asks)
+            if not signal.is_tradeable:
+                log.debug(
+                    "MarketMaker: skipping %s — signal confidence too low "
+                    "(%.2f < %.2f) regime=%s",
+                    condition_id[:8],
+                    signal.confidence,
+                    config.SIGNAL_CONFIDENCE_THRESHOLD,
+                    signal.regime,
+                )
+                return   # skip this market this cycle; existing orders stay live
 
         half_spread = config.MARKET_MAKER_SPREAD / 2
         our_bid = round(max(0.01, mid - half_spread), 4)

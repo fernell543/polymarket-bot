@@ -48,6 +48,88 @@ MM_TARGET_MARKETS = 5
 MIN_MARKETS_THRESHOLD = int(os.getenv("MIN_MARKETS_THRESHOLD", "10"))
 
 
+# ===========================================================================
+# Quant Mode — all advanced logic disabled by default (safe for all phases)
+# Set QUANT_MODE_ENABLED=1 in .env to activate.
+# ===========================================================================
+
+# Master switch: enables signal engine, vol-targeting, adaptive execution,
+# daily-loss / drawdown circuit breakers, and consecutive-loss cooldowns.
+QUANT_MODE_ENABLED = os.getenv("QUANT_MODE_ENABLED", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# Signal layer
+# ---------------------------------------------------------------------------
+
+# Factor weights — must not need to sum exactly to 1; they are applied
+# relative to each other within the regime-gated composite formula.
+SIGNAL_WEIGHT_MICRO    = float(os.getenv("SIGNAL_WEIGHT_MICRO",    "0.30"))
+SIGNAL_WEIGHT_MOMENTUM = float(os.getenv("SIGNAL_WEIGHT_MOMENTUM", "0.35"))
+SIGNAL_WEIGHT_MEAN_REV = float(os.getenv("SIGNAL_WEIGHT_MEAN_REV", "0.35"))
+
+# Minimum signal confidence [0..1] required to open a new position.
+# Lower = more trades, lower average quality.  Start conservative (0.40).
+SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.40"))
+
+# Rolling price std/mean above this ratio → "trending" regime
+# (momentum-dominant).  Below → "ranging" (mean-reversion-dominant).
+REGIME_HIGH_VOL_THRESHOLD = float(os.getenv("REGIME_HIGH_VOL_THRESHOLD", "0.02"))
+
+# ---------------------------------------------------------------------------
+# Risk engine
+# ---------------------------------------------------------------------------
+
+# Target annualised-ish volatility for vol-targeting (fraction of notional).
+# 0.05 = 5% daily vol target.  Lower = smaller positions in volatile markets.
+RISK_TARGET_VOL = float(os.getenv("RISK_TARGET_VOL", "0.05"))
+
+# Maximum USDC deployed in any single market at one time.
+RISK_MAX_MARKET_EXPOSURE = float(os.getenv("RISK_MAX_MARKET_EXPOSURE", "200.0"))
+
+# Maximum total USDC deployed across the entire portfolio.
+RISK_MAX_PORTFOLIO_EXPOSURE = float(os.getenv("RISK_MAX_PORTFOLIO_EXPOSURE", "1000.0"))
+
+# Hard stop: no new trades when daily realised P&L falls below -LIMIT USDC.
+# Resets at midnight UTC.
+RISK_DAILY_LOSS_LIMIT = float(os.getenv("RISK_DAILY_LOSS_LIMIT", "100.0"))
+
+# Hard stop: no new trades when session drawdown exceeds this USDC.
+# Does NOT auto-reset — requires manual restart or config change.
+RISK_MAX_DRAWDOWN = float(os.getenv("RISK_MAX_DRAWDOWN", "200.0"))
+
+# After this many consecutive losing trades → enter cooldown.
+RISK_MAX_CONSECUTIVE_LOSSES = int(os.getenv("RISK_MAX_CONSECUTIVE_LOSSES", "3"))
+
+# Duration of consecutive-loss cooldown in seconds (default 5 minutes).
+RISK_COOLDOWN_SECS = int(os.getenv("RISK_COOLDOWN_SECS", "300"))
+
+# ---------------------------------------------------------------------------
+# Execution layer
+# ---------------------------------------------------------------------------
+
+# Minimum net edge (after fee + slippage) required to place an order.
+# 0.010 = 1%.  Set higher to be more selective.
+EXEC_MIN_EDGE = float(os.getenv("EXEC_MIN_EDGE", "0.010"))
+
+# Signal confidence >= this → prefer market (taker) order for faster fill.
+EXEC_TAKER_CONFIDENCE_THRESHOLD = float(
+    os.getenv("EXEC_TAKER_CONFIDENCE_THRESHOLD", "0.80")
+)
+
+# Urgency >= this → prefer market order regardless of confidence.
+EXEC_TAKER_URGENCY_THRESHOLD = float(
+    os.getenv("EXEC_TAKER_URGENCY_THRESHOLD", "0.90")
+)
+
+# Bid-ask spread <= this → prefer limit (maker) order even at high confidence.
+EXEC_TAKER_SPREAD_THRESHOLD = float(
+    os.getenv("EXEC_TAKER_SPREAD_THRESHOLD", "0.005")
+)
+
+# Cancel unmatched limit orders after this many seconds.
+EXEC_ORDER_TIMEOUT_SECS = int(os.getenv("EXEC_ORDER_TIMEOUT_SECS", "120"))
+
+
 def validate():
     if not PRIVATE_KEY:
         raise ValueError("PRIVATE_KEY not set in .env")
