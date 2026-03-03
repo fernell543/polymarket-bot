@@ -13,6 +13,7 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 import logging.handlers
 import os
@@ -177,6 +178,13 @@ class Bot:
         log.info("MarketMaker loop starting")
         while self._running:
             try:
+                # Refresh balance so order sizing stays current
+                if config.DRY_RUN:
+                    self.market_maker.set_balance(config.MM_STARTING_BALANCE)
+                else:
+                    bal = await self.client.get_balance_usdc()
+                    self.market_maker.set_balance(bal)
+
                 targets = await self.market_maker.select_target_markets(
                     self._markets_cache
                 )
@@ -201,6 +209,8 @@ class Bot:
         while self._running:
             await asyncio.sleep(self.STATS_INTERVAL_SECS)
             log.info("STATS\n%s", self._format_stats())
+            with open("logs/perf.json", "w") as fh:
+                json.dump(self.market_maker.stats(), fh)
 
     def _format_stats(self) -> str:
         uptime = int(time.monotonic() - self._start_time)

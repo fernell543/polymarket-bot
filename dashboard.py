@@ -13,6 +13,7 @@ Updates every second. Shows:
 """
 
 import csv
+import json
 import os
 import time
 from collections import deque
@@ -28,6 +29,7 @@ from rich.text import Text
 
 ORDERS_CSV = "logs/orders.csv"
 BOT_LOG    = "logs/bot.log"
+PERF_JSON  = "logs/perf.json"
 REFRESH_HZ = 1   # seconds between updates
 
 console = Console()
@@ -58,6 +60,16 @@ def read_orders(max_rows: int = 50) -> list[dict]:
         return rows[-max_rows:]
     except OSError:
         return []
+
+
+def read_perf() -> dict:
+    if not os.path.isfile(PERF_JSON):
+        return {}
+    try:
+        with open(PERF_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
 def bot_running() -> bool:
@@ -165,7 +177,7 @@ def make_log_panel(lines: list[str]) -> Panel:
     )
 
 
-def make_stats_panel(orders: list[dict]) -> Panel:
+def make_stats_panel(orders: list[dict], perf: dict) -> Panel:
     total   = len(orders)
     buys    = sum(1 for o in orders if o.get("side") == "BUY")
     sells   = sum(1 for o in orders if o.get("side") == "SELL")
@@ -180,6 +192,15 @@ def make_stats_panel(orders: list[dict]) -> Panel:
     limits  = sum(1 for o in orders if o.get("type") == "LIMIT")
     markets = sum(1 for o in orders if o.get("type") == "MARKET")
 
+    wins      = perf.get("wins", 0)
+    losses    = perf.get("losses", 0)
+    win_rate  = perf.get("win_rate", 0.0)
+    sim_pnl   = perf.get("estimated_pnl", 0.0)
+    fills     = perf.get("total_fills", 0)
+
+    pnl_style = "bold green" if sim_pnl >= 0 else "bold red"
+    pnl_sign  = "+" if sim_pnl >= 0 else ""
+
     grid = Table.grid(padding=(0, 2))
     grid.add_column(style="dim", justify="right")
     grid.add_column(style="bold white")
@@ -189,6 +210,11 @@ def make_stats_panel(orders: list[dict]) -> Panel:
     grid.add_row("LIMIT / MARKET", f"{limits} / {markets}")
     grid.add_row("Dry / Live",     f"{dry} / {live}")
     grid.add_row("Total USDC",     f"${total_usdc:,.2f}")
+    grid.add_row("",               "")
+    grid.add_row("Sim Fills",      str(fills))
+    grid.add_row("W / L",          f"{wins} / {losses}")
+    grid.add_row("Win Rate",       f"{win_rate:.1f}%")
+    grid.add_row("Sim PnL",        Text(f"${pnl_sign}{sim_pnl:.4f}", style=pnl_style))
 
     return Panel(grid, title="[bold yellow]Stats[/bold yellow]", border_style="yellow")
 
@@ -197,7 +223,7 @@ def make_stats_panel(orders: list[dict]) -> Panel:
 # Main render loop
 # ---------------------------------------------------------------------------
 
-def build_layout(orders: list[dict], log_lines: list[str]) -> Layout:
+def build_layout(orders: list[dict], log_lines: list[str], perf: dict) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=4),
@@ -211,7 +237,7 @@ def build_layout(orders: list[dict], log_lines: list[str]) -> Layout:
 
     layout["header"].update(make_header())
     layout["orders"].update(make_orders_table(orders))
-    layout["sidebar"].update(make_stats_panel(orders))
+    layout["sidebar"].update(make_stats_panel(orders, perf))
     layout["footer"].update(make_log_panel(log_lines))
 
     return layout
@@ -223,7 +249,8 @@ def main():
         while True:
             orders    = read_orders()
             log_lines = read_last_log_lines(18)
-            live.update(build_layout(orders, log_lines))
+            perf      = read_perf()
+            live.update(build_layout(orders, log_lines, perf))
             time.sleep(REFRESH_HZ)
 
 

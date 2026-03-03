@@ -21,6 +21,13 @@ For each target market:
   - Spread = config.MARKET_MAKER_SPREAD (e.g. 2%).
   - Cancel and replace every MM_REBALANCE_INTERVAL seconds.
   - Skip if inventory is too imbalanced (> MAX_INVENTORY_IMBALANCE).
+
+Position sizing
+---------------
+Order size is calculated dynamically from your account balance:
+  order_size = balance * MM_CAPITAL_PCT / (MM_TARGET_MARKETS * 4)
+This keeps total capital deployed at MM_CAPITAL_PCT of balance regardless
+of account size, and auto-adjusts as your balance grows or shrinks.
 """
 
 import asyncio
@@ -35,6 +42,34 @@ from client import PolymarketClient, Market
 log = logging.getLogger(__name__)
 
 MAX_INVENTORY_IMBALANCE = 0.7   # cancel/pause if one side > 70% of total
+
+
+def _simulate_fills(pos: "MMPosition", current_mid: float, size_usdc: float) -> None:
+    """
+    Check if previous limit orders would have filled based on current mid price.
+
+    BUY fills when mid drops to/below our bid (market moved down to us).
+    SELL fills when mid rises to/above our ask (market moved up to us).
+    Win  = both sides fill → captured the spread.
+    Loss = only one side fills → adverse selection (market moved strongly one way).
+    """
+    no_mid = 1.0 - current_mid
+    for buy_hit, sell_hit, bid_p, ask_p in [
+        (current_mid <= pos.yes_bid_price, current_mid >= pos.yes_ask_price,
+         pos.yes_bid_price, pos.yes_ask_price),
+        (no_mid <= pos.no_bid_price, no_mid >= pos.no_ask_price,
+         pos.no_bid_price, pos.no_ask_price),
+    ]:
+        if bid_p <= 0:
+            continue  # no previous order
+        if buy_hit and sell_hit:
+            pos.total_pnl += (ask_p - bid_p) * (size_usdc / bid_p)
+            pos.total_fills += 2
+            pos.wins += 1
+        elif buy_hit or sell_hit:
+            pos.total_pnl -= ((ask_p - bid_p) / 2) * (size_usdc / bid_p)
+            pos.total_fills += 1
+            pos.losses += 1
 
 
 @dataclass
@@ -52,16 +87,38 @@ class MMPosition:
     total_fills: int = 0
     total_pnl: float = 0.0
     last_refresh: float = field(default_factory=time.monotonic)
+    # fill simulation tracking (dry run only)
+    yes_bid_price: float = 0.0
+    yes_ask_price: float = 0.0
+    no_bid_price: float = 0.0
+    no_ask_price: float = 0.0
+    wins: int = 0
+    losses: int = 0
 
 
 class MarketMakerStrategy:
     """
     Maintains two-sided quotes on high-reward Polymarket markets.
+    Order size auto-scales with account balance.
     """
 
     def __init__(self, client: PolymarketClient):
         self.client = client
         self._positions: dict[str, MMPosition] = {}   # condition_id → position
+        self._balance: float = config.MM_STARTING_BALANCE  # updated by bot.py
+
+    def set_balance(self, balance: float) -> None:
+        """Called by the orchestrator whenever a fresh balance is fetched."""
+        if balance > 0:
+            self._balance = balance
+
+    def _order_size_usdc(self) -> float:
+        """
+        Compute per-order size so total deployed ≤ MM_CAPITAL_PCT of balance.
+        Floor at $5 so tiny balances still place valid orders.
+        """
+        size = self._balance * config.MM_CAPITAL_PCT / (config.MM_TARGET_MARKETS * 4)
+        return max(5.0, round(size, 2))
 
     # ------------------------------------------------------------------
     # Market selection
@@ -103,9 +160,12 @@ class MarketMakerStrategy:
         selected = candidates[: config.MM_TARGET_MARKETS]
 
         log.info(
-            "MarketMaker: selected %d target markets (%d reward markets)",
+            "MarketMaker: selected %d target markets (%d reward markets) "
+            "order_size=%.2f USDC (balance=%.2f)",
             len(selected),
             sum(1 for s in selected if s[0] == 2),
+            self._order_size_usdc(),
+            self._balance,
         )
         return [(m, y, n) for _, m, y, n in selected]
 
@@ -143,6 +203,10 @@ class MarketMakerStrategy:
 
         pos = self._positions.get(condition_id)
 
+        # Simulate fills from previous orders before replacing them
+        if config.DRY_RUN and pos and pos.yes_bid_price > 0:
+            _simulate_fills(pos, mid, self._order_size_usdc())
+
         # Cancel stale orders before replacing
         if pos:
             cancel_tasks = []
@@ -155,10 +219,10 @@ class MarketMakerStrategy:
             if cancel_tasks:
                 await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
-        size_usdc = config.MM_ORDER_SIZE_USDC
+        size_usdc = self._order_size_usdc()
 
         log.debug(
-            "MarketMaker: %s | YES bid=%.4f ask=%.4f | NO bid=%.4f ask=%.4f | size=%.0f USDC",
+            "MarketMaker: %s | YES bid=%.4f ask=%.4f | NO bid=%.4f ask=%.4f | size=%.2f USDC",
             condition_id[:8], our_bid, our_ask, no_bid, no_ask, size_usdc,
         )
 
@@ -185,6 +249,12 @@ class MarketMakerStrategy:
             no_inventory=pos.no_inventory if pos else 0.0,
             total_fills=pos.total_fills if pos else 0,
             total_pnl=pos.total_pnl if pos else 0.0,
+            yes_bid_price=our_bid,
+            yes_ask_price=our_ask,
+            no_bid_price=no_bid,
+            no_ask_price=no_ask,
+            wins=pos.wins if pos else 0,
+            losses=pos.losses if pos else 0,
         )
         self._positions[condition_id] = new_pos
 
@@ -234,8 +304,17 @@ class MarketMakerStrategy:
         active = len(self._positions)
         total_fills = sum(p.total_fills for p in self._positions.values())
         total_pnl = sum(p.total_pnl for p in self._positions.values())
+        wins = sum(p.wins for p in self._positions.values())
+        losses = sum(p.losses for p in self._positions.values())
+        total_trades = wins + losses
+        win_rate = (wins / total_trades * 100) if total_trades else 0.0
         return {
             "active_positions": active,
             "total_fills": total_fills,
-            "estimated_pnl": round(total_pnl, 2),
+            "estimated_pnl": round(total_pnl, 4),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 1),
+            "order_size_usdc": self._order_size_usdc(),
+            "balance": round(self._balance, 2),
         }

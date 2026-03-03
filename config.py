@@ -11,7 +11,12 @@ POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
 MAX_POSITION_USDC = float(os.getenv("MAX_POSITION_USDC", "500"))
 ARB_MIN_PROFIT_PCT = float(os.getenv("ARB_MIN_PROFIT_PCT", "0.03"))
 MARKET_MAKER_SPREAD = float(os.getenv("MARKET_MAKER_SPREAD", "0.02"))
-MM_ORDER_SIZE_USDC = float(os.getenv("MM_ORDER_SIZE_USDC", "100"))
+
+# Dynamic position sizing: deploy this fraction of balance across all MM orders.
+# order_size = balance * MM_CAPITAL_PCT / (MM_TARGET_MARKETS * 4 orders)
+# e.g. $5000 * 0.20 / (5 * 4) = $50/order, $1000 total deployed (20% of balance)
+MM_CAPITAL_PCT      = float(os.getenv("MM_CAPITAL_PCT", "0.20"))
+MM_STARTING_BALANCE = float(os.getenv("MM_STARTING_BALANCE", "5000"))
 
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
