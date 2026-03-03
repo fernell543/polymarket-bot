@@ -14,10 +14,14 @@ Risk: settlement / oracle failure (rare on Polymarket with UMA).
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import config
 from client import PolymarketClient, Market
+
+if TYPE_CHECKING:
+    from health_state import HealthState
+    from risk.sizing import PositionSizer
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +57,14 @@ class PriceArbStrategy:
     def __init__(self, client: PolymarketClient):
         self.client = client
         self._executions: list[ArbResult] = []
+        self._sizer: Optional["PositionSizer"] = None
+        self._health: Optional["HealthState"] = None
+
+    def set_sizer(self, sizer: "PositionSizer") -> None:
+        self._sizer = sizer
+
+    def set_health(self, health: "HealthState") -> None:
+        self._health = health
 
     # ------------------------------------------------------------------
     # Scanning
@@ -128,9 +140,32 @@ class PriceArbStrategy:
         Execute both legs of an arbitrage simultaneously.
 
         We buy both YES and NO as market orders so they fill immediately.
-        Size is limited by MAX_POSITION_USDC / 2 per leg.
+        Total size is determined by the risk-based sizer (falls back to a
+        fixed cap when no sizer is wired in).
         """
-        leg_usdc = min(config.MAX_POSITION_USDC / 2, 100)
+        if self._sizer is not None:
+            # edge_bps: net profit as fraction of combined cost → basis points
+            edge_bps = opp.profit_pct * 10_000
+            health_level = self._health.level if self._health else None
+            sr = self._sizer.compute(
+                edge_bps=edge_bps,
+                confidence=1.0,      # locked-profit arb — outcome is deterministic
+                vol_regime="low",    # no price-vol risk (deterministic payoff)
+                health_level=health_level,
+                label="PriceArb",
+            )
+            if sr.size_usdc == 0:
+                log.warning(
+                    "PriceArb: sizer blocked execution for %s (reason=%s)",
+                    market_label(opp.market), sr.reason,
+                )
+                result = ArbResult(opportunity=opp, error=f"sizer:{sr.reason}")
+                self._executions.append(result)
+                return result
+            leg_usdc = sr.size_usdc / 2   # split total size across both legs
+        else:
+            # Fallback: fixed cap (no sizer wired yet)
+            leg_usdc = min(config.MAX_POSITION_USDC / 2, 100)
 
         log.info(
             "PriceArb EXECUTE | %s | YES@%.4f + NO@%.4f = %.4f | "

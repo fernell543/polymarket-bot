@@ -28,11 +28,15 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import config
 from client import PolymarketClient, Market
 from feeds.price_feed import BTCPriceFeed
+
+if TYPE_CHECKING:
+    from health_state import HealthState
+    from risk.sizing import PositionSizer
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +97,14 @@ class LatencyArbStrategy:
         self._trades: list[LatencyArbTrade] = []
         self._last_market_refresh = 0.0
         self._market_refresh_interval = 120.0   # refresh market list every 2 min
+        self._sizer: Optional["PositionSizer"] = None
+        self._health: Optional["HealthState"] = None
+
+    def set_sizer(self, sizer: "PositionSizer") -> None:
+        self._sizer = sizer
+
+    def set_health(self, health: "HealthState") -> None:
+        self._health = health
 
     # ------------------------------------------------------------------
     # Market discovery
@@ -258,7 +270,30 @@ class LatencyArbStrategy:
         if discount < MIN_DISCOUNT:
             return None
 
-        size_usdc = min(config.MAX_POSITION_USDC, 200)
+        if self._sizer is not None:
+            # Confidence: scales with how far BTC is from the threshold.
+            # At the minimum certainty gap → 0.25; at 4× the gap → 1.0.
+            confidence = min(1.0, gap_pct / (CERTAINTY_GAP_PCT * 4))
+            edge_bps = discount * 10_000   # discount fraction → basis points
+            health_level = self._health.level if self._health else None
+            sr = self._sizer.compute(
+                edge_bps=edge_bps,
+                confidence=confidence,
+                vol_regime="mid",        # binary, time-pressured outcome
+                health_level=health_level,
+                label="LatencyArb",
+            )
+            if sr.size_usdc == 0:
+                log.debug(
+                    "LatencyArb: sizer blocked %s (reason=%s)",
+                    market_label(btc_market.market), sr.reason,
+                )
+                return None
+            size_usdc = sr.size_usdc
+        else:
+            # Fallback: fixed cap (no sizer wired yet)
+            size_usdc = min(config.MAX_POSITION_USDC, 200)
+
         expected_profit = discount * (size_usdc / ask)
 
         log.info(

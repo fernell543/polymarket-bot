@@ -34,11 +34,16 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import config
 from client import PolymarketClient, Market
+from risk.sizing import signal_regime_to_vol
 from signals import SignalEngine, SignalResult
+
+if TYPE_CHECKING:
+    from health_state import HealthState
+    from risk.sizing import PositionSizer
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +115,14 @@ class MarketMakerStrategy:
         self._size_multiplier: float = 1.0   # set by kill-switch (0.5 = Tier 2)
         # One SignalEngine per YES token (keyed by token_id)
         self._signal_engines: dict[str, SignalEngine] = {}
+        self._sizer: Optional["PositionSizer"] = None
+        self._health: Optional["HealthState"] = None
+
+    def set_sizer(self, sizer: "PositionSizer") -> None:
+        self._sizer = sizer
+
+    def set_health(self, health: "HealthState") -> None:
+        self._health = health
 
     def set_balance(self, balance: float) -> None:
         """Called by the orchestrator whenever a fresh balance is fetched."""
@@ -266,6 +279,36 @@ class MarketMakerStrategy:
                 await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
         size_usdc = self._order_size_usdc()
+
+        # Risk-based sizing guards: apply edge/confidence/health checks.
+        # The capital-fraction formula above gives the raw base; the sizer
+        # validates and scales it.  size=0 means skip this market this cycle.
+        if self._sizer is not None:
+            # Expected edge per fill = half the quoted spread, in bps
+            edge_bps = config.MARKET_MAKER_SPREAD * 5_000
+            # Confidence + regime come from signal engine when quant is active
+            if signal is not None and config.QUANT_MODE_ENABLED:
+                confidence = signal.confidence
+                vol_regime = signal_regime_to_vol(signal.regime)
+            else:
+                confidence = 1.0
+                vol_regime = "mid"
+            health_level = self._health.level if self._health else None
+            sr = self._sizer.apply_to(
+                base_usdc=size_usdc,
+                edge_bps=edge_bps,
+                confidence=confidence,
+                vol_regime=vol_regime,
+                health_level=health_level,
+                label="MarketMaker",
+            )
+            if sr.size_usdc == 0:
+                log.debug(
+                    "MarketMaker: sizer blocked %s (reason=%s) — skipping quote",
+                    condition_id[:8], sr.reason,
+                )
+                return
+            size_usdc = sr.size_usdc
 
         log.debug(
             "MarketMaker: %s | YES bid=%.4f ask=%.4f | NO bid=%.4f ask=%.4f | size=%.2f USDC",

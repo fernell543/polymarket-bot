@@ -28,7 +28,7 @@ from client import PolymarketClient
 from execution import ExecutionManager
 from feeds.price_feed import BTCPriceFeed
 from health_state import HealthState, HealthLevel
-from risk import RiskEngine, CircuitBreakerState
+from risk import RiskEngine, CircuitBreakerState, PositionSizer
 from risk.kill_switch import KillSwitch
 from strategies import PriceArbStrategy, LatencyArbStrategy, MarketMakerStrategy
 
@@ -91,7 +91,13 @@ class Bot:
         self.exec_manager  = ExecutionManager(self.client)
         self.trade_logger  = QuantTradeLogger()
         self.kill_switch   = KillSwitch()
+        self.sizer         = PositionSizer()
         self._session_start: float = time.time()
+
+        # Wire risk-based sizer + health state into all strategies
+        for _strat in (self.price_arb, self.latency_arb, self.market_maker):
+            _strat.set_sizer(self.sizer)
+            _strat.set_health(self.health)
 
         self._markets_cache: list = []
         self._tasks: list[asyncio.Task] = []
@@ -462,10 +468,11 @@ class Bot:
 
                 # Refresh balance so order sizing stays current
                 if config.DRY_RUN:
-                    self.market_maker.set_balance(config.MM_STARTING_BALANCE)
+                    bal = config.MM_STARTING_BALANCE
                 else:
                     bal = await self.client.get_balance_usdc()
-                    self.market_maker.set_balance(bal)
+                self.market_maker.set_balance(bal)
+                self.sizer.set_balance(bal)   # keep sizer in sync with live balance
 
                 targets = await self.market_maker.select_target_markets(
                     self._markets_cache

@@ -34,6 +34,61 @@ DRY_RUN=0 python bot.py
 
 ---
 
+## Risk-Based Sizing (how it works + knobs)
+
+Every order size is computed dynamically by `risk/sizing.py` rather than using
+hardcoded constants.  There is **no martingale logic** — sizes only scale with
+the quality of the trade, never to recover prior losses.
+
+### Formula
+
+```
+edge_scalar = clamp(edge_bps / EDGE_REFERENCE_BPS, 0, 2.0)
+size        = base_usdc × edge_scalar × confidence × vol_mult
+size        = clamp(size, SIZE_MIN_USDC, SIZE_MAX_USDC)
+```
+
+Where `base_usdc` is:
+- **PriceArb / LatencyArb**: `balance × RISK_BUDGET_PCT` (risk-budget approach)
+- **MarketMaker**: `balance × MM_CAPITAL_PCT / (markets × 4)` (capital-fraction, same as before)
+
+### Protection guards (size=0 if any trigger)
+
+| Guard | Condition | Reason code |
+|---|---|---|
+| Health | `health >= SAFE_MODE` | `safe_mode` |
+| Edge floor | `edge_bps < EDGE_FLOOR_BPS` | `edge_below_floor` |
+| Confidence floor | `confidence < CONFIDENCE_FLOOR` | `confidence_below_floor` |
+
+### Sizing knobs
+
+| Variable | Default | Description |
+|---|---|---|
+| `RISK_BUDGET_PCT` | `0.02` | Fraction of balance risked per directional trade (2%) |
+| `SIZE_MIN_USDC` | `5.0` | Absolute floor on any computed size |
+| `SIZE_MAX_USDC` | `500.0` | Hard ceiling on any computed size |
+| `VOL_MULT_LOW` | `1.2` | Size multiplier in low-vol / ranging markets |
+| `VOL_MULT_MID` | `1.0` | Size multiplier at baseline |
+| `VOL_MULT_HIGH` | `0.6` | Size multiplier in high-vol / trending markets |
+| `CONFIDENCE_FLOOR` | `0.20` | Signal confidence below this → size=0 |
+| `EDGE_FLOOR_BPS` | `50.0` | Net edge below 50 bps (0.5%) → size=0 |
+| `EDGE_REFERENCE_BPS` | `100.0` | Edge at this BPS → edge_scalar=1.0 (baseline) |
+
+### Before vs after
+
+| Strategy | Before | After |
+|---|---|---|
+| PriceArb | `min(MAX_POSITION / 2, 100)` per leg — fixed $100 | `balance × RISK_BUDGET_PCT × edge_scalar × 1.0 × VOL_MULT_LOW / 2` per leg |
+| LatencyArb | `min(MAX_POSITION, 200)` — fixed $200 | `balance × RISK_BUDGET_PCT × edge_scalar × confidence × VOL_MULT_MID` |
+| MarketMaker | `balance × MM_CAPITAL_PCT / slots × kill_switch_mult` | Same base, now gated by edge / confidence / health guards; regime adjusts vol_mult |
+
+With default `$5,000` balance and `RISK_BUDGET_PCT=0.02` (`base=$100`):
+- PriceArb at 3% profit: `$100 × 2.0 × 1.0 × 1.2 / 2 = $120` per leg (was $100)
+- LatencyArb at 28% discount, full certainty: `$100 × 2.0 × 1.0 × 1.0 = $200` (same; scales with balance)
+- MarketMaker at 2% spread: base `$50`, edge_scalar=1.0, unchanged unless signal or health blocks
+
+---
+
 ## Configuration Reference
 
 All settings can be set as environment variables or in `.env`.

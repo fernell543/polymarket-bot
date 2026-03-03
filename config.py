@@ -10,6 +10,37 @@ POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
 
 MAX_POSITION_USDC = float(os.getenv("MAX_POSITION_USDC", "500"))
 ARB_MIN_PROFIT_PCT = float(os.getenv("ARB_MIN_PROFIT_PCT", "0.03"))
+
+# ===========================================================================
+# Risk-based position sizing  (risk/sizing.py — always active)
+# ===========================================================================
+# Fraction of account balance risked on a single directional trade.
+# PriceArb / LatencyArb base = balance × RISK_BUDGET_PCT.
+# MarketMaker uses its own capital-fraction base; guards still apply.
+RISK_BUDGET_PCT     = float(os.getenv("RISK_BUDGET_PCT",     "0.02"))   # 2 % of balance
+
+# Absolute floor / ceiling applied after all multipliers.
+SIZE_MIN_USDC       = float(os.getenv("SIZE_MIN_USDC",       "5.0"))
+SIZE_MAX_USDC       = float(os.getenv("SIZE_MAX_USDC",       "500.0"))
+
+# Vol-regime multipliers applied to the base size.
+# low  = calm/ranging market (arb or tight spread) → slight size increase
+# mid  = neutral baseline
+# high = trending/volatile market                  → size reduction
+VOL_MULT_LOW        = float(os.getenv("VOL_MULT_LOW",        "1.2"))
+VOL_MULT_MID        = float(os.getenv("VOL_MULT_MID",        "1.0"))
+VOL_MULT_HIGH       = float(os.getenv("VOL_MULT_HIGH",       "0.6"))
+
+# Guard: signal confidence below this → size=0 (trade skipped entirely).
+CONFIDENCE_FLOOR    = float(os.getenv("CONFIDENCE_FLOOR",    "0.20"))
+
+# Guard: net expected edge below this → size=0.
+# 50 bps = 0.5 %.  Must exceed fees + slippage to be worth trading.
+EDGE_FLOOR_BPS      = float(os.getenv("EDGE_FLOOR_BPS",      "50.0"))
+
+# Normalisation point: edge at this BPS → edge_scalar=1.0.
+# Edge above → scalar up to 2× cap; edge below (but above floor) → scalar <1.
+EDGE_REFERENCE_BPS  = float(os.getenv("EDGE_REFERENCE_BPS",  "100.0"))
 MARKET_MAKER_SPREAD = float(os.getenv("MARKET_MAKER_SPREAD", "0.02"))
 
 # Dynamic position sizing: deploy this fraction of balance across all MM orders.
