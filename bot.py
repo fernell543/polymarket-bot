@@ -14,6 +14,8 @@ Usage:
 
 import asyncio
 import logging
+import logging.handlers
+import os
 import signal
 import sys
 import time
@@ -25,14 +27,25 @@ from feeds.price_feed import BTCPriceFeed
 from strategies import PriceArbStrategy, LatencyArbStrategy, MarketMakerStrategy
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — console + rotating file
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    datefmt="%H:%M:%S",
+os.makedirs("logs", exist_ok=True)
+
+_fmt = logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+_console = logging.StreamHandler()
+_console.setFormatter(_fmt)
+
+_file_handler = logging.handlers.RotatingFileHandler(
+    "logs/bot.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_file_handler.setFormatter(_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console, _file_handler])
 log = logging.getLogger("bot")
 
 

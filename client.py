@@ -6,13 +6,34 @@ and aiohttp for non-blocking HTTP calls.
 """
 
 import asyncio
+import csv
 import logging
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
 
 import config
+
+# ---------------------------------------------------------------------------
+# Order CSV logger
+# ---------------------------------------------------------------------------
+
+os.makedirs("logs", exist_ok=True)
+_ORDER_LOG = "logs/orders.csv"
+
+def _log_order_csv(order_type, side, token_id, price, size_usdc, size_shares, order_id, status, dry_run):
+    file_exists = os.path.isfile(_ORDER_LOG)
+    with open(_ORDER_LOG, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp", "type", "side", "token_id", "price", "size_usdc", "size_shares", "order_id", "status", "dry_run"])
+        writer.writerow([
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            order_type, side, token_id, price, size_usdc, size_shares, order_id, status, dry_run
+        ])
 
 log = logging.getLogger(__name__)
 
@@ -236,6 +257,7 @@ class PolymarketClient:
         )
 
         if config.DRY_RUN:
+            _log_order_csv("LIMIT", side, token_id, price, size_usdc, size_shares, "DRY-RUN", "simulated", True)
             return PlacedOrder(
                 order_id="DRY-RUN", status="simulated", success=True
             )
@@ -260,12 +282,14 @@ class PolymarketClient:
             resp = self._clob_client.post_order(signed, OrderType.GTC)
 
             success = resp.get("success", False)
-            return PlacedOrder(
+            placed = PlacedOrder(
                 order_id=resp.get("orderID", ""),
                 status=resp.get("status", "unknown"),
                 success=success,
                 error=None if success else str(resp),
             )
+            _log_order_csv("LIMIT", side, token_id, price, size_usdc, size_shares, placed.order_id, placed.status, False)
+            return placed
         except Exception as exc:
             log.error("place_limit_order failed: %s", exc)
             return PlacedOrder(order_id="", status="error", success=False, error=str(exc))
@@ -291,7 +315,10 @@ class PolymarketClient:
             side, token_id[:8], price, size_usdc, config.DRY_RUN,
         )
 
+        size_shares = round(size_usdc / price, 4)
+
         if config.DRY_RUN:
+            _log_order_csv("MARKET", side, token_id, price, size_usdc, size_shares, "DRY-RUN", "simulated", True)
             return PlacedOrder(order_id="DRY-RUN", status="simulated", success=True)
 
         if self._clob_client is None:
@@ -304,7 +331,6 @@ class PolymarketClient:
             from py_clob_client.clob_types import OrderArgs, OrderType, Side
 
             py_side = Side.BUY if side == "BUY" else Side.SELL
-            size_shares = round(size_usdc / price, 4)
             order_args = OrderArgs(
                 token_id=token_id,
                 price=round(price, 4),
@@ -315,12 +341,14 @@ class PolymarketClient:
             resp = self._clob_client.post_order(signed, OrderType.FOK)
 
             success = resp.get("success", False)
-            return PlacedOrder(
+            placed = PlacedOrder(
                 order_id=resp.get("orderID", ""),
                 status=resp.get("status", "unknown"),
                 success=success,
                 error=None if success else str(resp),
             )
+            _log_order_csv("MARKET", side, token_id, price, size_usdc, size_shares, placed.order_id, placed.status, False)
+            return placed
         except Exception as exc:
             log.error("place_market_order failed: %s", exc)
             return PlacedOrder(order_id="", status="error", success=False, error=str(exc))
