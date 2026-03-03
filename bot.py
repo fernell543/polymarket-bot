@@ -218,8 +218,9 @@ async def main():
         log.info("Received %s — shutting down…", sig.name)
         loop.create_task(bot.stop())
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _shutdown, sig)
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _shutdown, sig)
 
     await bot.start()
 
