@@ -76,6 +76,7 @@ class PolymarketClient:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._clob_client = None  # py-clob-client instance
+        self._rewards_available: bool = True  # latched False on first 405
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -137,9 +138,7 @@ class PolymarketClient:
             if next_cursor:
                 params["next_cursor"] = next_cursor
 
-            async with self._session.get("/markets", params=params) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+            data = await self._get_json("/markets", params)
 
             for m in data.get("data", []):
                 markets.append(
@@ -197,12 +196,66 @@ class PolymarketClient:
         bid, ask = await self.get_best_prices(token_id)
         return (bid + ask) / 2
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _get_json(
+        self,
+        path: str,
+        params: Optional[dict] = None,
+        *,
+        max_retries: int = 3,
+    ):
+        """
+        GET a JSON endpoint with exponential-backoff retry on transient
+        5xx errors and network timeouts.  4xx errors are re-raised immediately.
+        """
+        params = params or {}
+        delay = 1.0
+        for attempt in range(max_retries):
+            try:
+                async with self._session.get(path, params=params) as resp:
+                    if resp.status in (502, 503, 504) and attempt < max_retries - 1:
+                        log.warning(
+                            "HTTP %d on %s — retry %d/%d in %.0fs",
+                            resp.status, path, attempt + 1, max_retries - 1, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        continue
+                    resp.raise_for_status()
+                    return await resp.json()
+            except aiohttp.ClientResponseError:
+                raise   # 4xx or exhausted 5xx — propagate to caller
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt < max_retries - 1:
+                    log.warning(
+                        "Network error on %s (attempt %d/%d): %s — retrying in %.0fs",
+                        path, attempt + 1, max_retries, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                raise
+
     async def get_rewards_markets(self) -> list[dict]:
-        """Return markets currently earning liquidity rewards."""
+        """Return markets currently earning liquidity rewards.
+
+        If the endpoint returns 405 (not supported on this env) the flag
+        ``_rewards_available`` is latched to False and subsequent calls
+        return [] immediately without hitting the network.
+        """
+        if not self._rewards_available:
+            return []
         try:
-            async with self._session.get(
-                "/rewards/markets_earning_daily"
-            ) as resp:
+            async with self._session.get("/rewards/markets_earning_daily") as resp:
+                if resp.status == 405:
+                    log.info(
+                        "Rewards endpoint returned 405 — feature unavailable, disabling."
+                    )
+                    self._rewards_available = False
+                    return []
                 resp.raise_for_status()
                 return await resp.json()
         except Exception as exc:
