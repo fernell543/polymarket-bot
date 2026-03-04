@@ -280,18 +280,21 @@ class PolymarketClient:
             log.warning("Could not fetch rewards markets: %s", exc)
             return []
 
-    async def get_balance_usdc(self) -> float:
-        """Return available USDC balance for the wallet."""
+    async def get_balance_usdc(self) -> tuple[float, str]:
+        """Return (balance_usdc, note) where note explains the source or failure reason."""
+        if not config.WALLET_ADDRESS:
+            return 0.0, "WALLET_ADDRESS not set"
         try:
             async with self._session.get(
                 "/balance", params={"address": config.WALLET_ADDRESS}
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data.get("balance", 0))
+                    return float(data.get("balance", 0)), "live"
+                return 0.0, f"API returned HTTP {resp.status}"
         except Exception as exc:
             log.debug("get_balance: %s", exc)
-        return 0.0
+            return 0.0, f"API unavailable ({type(exc).__name__})"
 
     async def get_open_orders(self) -> list[dict]:
         """Return open orders for this wallet."""

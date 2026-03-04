@@ -407,6 +407,31 @@ python -m analytics.fill_quality -v
 
 ---
 
+## Account details in dashboard
+
+Every 60-second stats refresh (and at shutdown) the console output includes:
+
+```
+  Mode:          DRY_RUN (simulated execution)   ← or "LIVE"
+  Wallet:        0xYourAddress                   ← or "(not set — WALLET_ADDRESS missing)"
+  Balance:       $5,000.00 USDC (simulated)      ← or "(live)" / "(API unavailable …)"
+```
+
+**Behaviour by mode:**
+
+| Situation | Mode line | Balance line |
+|---|---|---|
+| `DRY_RUN=1`, no wallet set | `DRY_RUN (simulated execution)` | `$5000.00 USDC (simulated)` |
+| `DRY_RUN=1`, wallet set | `DRY_RUN (simulated execution)` | `$5000.00 USDC (simulated)` |
+| `DRY_RUN=0`, wallet set | `LIVE` | real balance from API, e.g. `$312.45 USDC (live)` |
+| `DRY_RUN=0`, API down | `LIVE` | `$0.00 USDC (API unavailable (…))` |
+| `DRY_RUN=0`, no wallet set | aborts at startup | n/a |
+
+`MM_STARTING_BALANCE` (default `5000`) controls the simulated paper balance.
+The same fields (`mode`, `wallet`, `balance_usdc`, `balance_note`) are written to `logs/perf.json` on every cycle.
+
+---
+
 ## Logs
 
 | File | Contents |
@@ -414,6 +439,6 @@ python -m analytics.fill_quality -v
 | `logs/bot.log` | Rotating main log (5 MB x 5 files) |
 | `logs/orders.csv` | All orders placed (basic client log) |
 | `logs/quant_trades.csv` | Rich quant log with signal + risk reason codes |
-| `logs/perf.json` | Live performance snapshot (written every 60s) |
+| `logs/perf.json` | Live performance snapshot (written every 60s) — includes `mode`, `wallet`, `balance_usdc` |
 | `logs/opt_results.csv` | Parameter optimizer results (ranked configs) |
 | `logs/opt_best.json` | Top-3 configs from last optimizer run |

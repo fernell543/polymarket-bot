@@ -104,6 +104,10 @@ class Bot:
         self._running = False
         self._start_time = 0.0
 
+        # Dashboard balance state — kept in sync by _market_maker_loop
+        self._dashboard_balance: float = 0.0
+        self._dashboard_balance_note: str = "initializing..."
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -137,6 +141,22 @@ class Bot:
 
         # Initial market list fetch
         await self._refresh_markets()
+
+        # Pre-fetch balance so first stats printout already shows account details
+        if config.DRY_RUN:
+            self._dashboard_balance = config.MM_STARTING_BALANCE
+            self._dashboard_balance_note = "simulated"
+        else:
+            bal, note = await self.client.get_balance_usdc()
+            self._dashboard_balance = bal
+            self._dashboard_balance_note = note
+        log.info(
+            "Account  wallet=%s  balance=%.2f USDC (%s)  mode=%s",
+            config.WALLET_ADDRESS or "(not set)",
+            self._dashboard_balance,
+            self._dashboard_balance_note,
+            "DRY_RUN" if config.DRY_RUN else "LIVE",
+        )
 
         # Spawn all async tasks
         self._tasks = [
@@ -469,8 +489,12 @@ class Bot:
                 # Refresh balance so order sizing stays current
                 if config.DRY_RUN:
                     bal = config.MM_STARTING_BALANCE
+                    self._dashboard_balance = bal
+                    self._dashboard_balance_note = "simulated"
                 else:
-                    bal = await self.client.get_balance_usdc()
+                    bal, note = await self.client.get_balance_usdc()
+                    self._dashboard_balance = bal
+                    self._dashboard_balance_note = note
                 self.market_maker.set_balance(bal)
                 self.sizer.set_balance(bal)   # keep sizer in sync with live balance
 
@@ -503,6 +527,10 @@ class Bot:
             fq_st = self.exec_manager.fill_quality_stats()
             perf = {
                 **self.market_maker.stats(),
+                "mode": "dry_run" if config.DRY_RUN else "live",
+                "wallet": config.WALLET_ADDRESS or "",
+                "balance_usdc": self._dashboard_balance,
+                "balance_note": self._dashboard_balance_note,
                 "health": self.health.level.name,
                 "health_reason": self.health.reason,
                 "health_size_multiplier": self.health.size_multiplier,
@@ -525,7 +553,13 @@ class Bot:
         risk_st = self.risk_engine.state
         ks_st = self.kill_switch.state
         fq_st = self.exec_manager.fill_quality_stats()
+        mode_str   = "DRY_RUN (simulated execution)" if config.DRY_RUN else "LIVE"
+        wallet_str = config.WALLET_ADDRESS if config.WALLET_ADDRESS else "(not set — WALLET_ADDRESS missing)"
+        bal_str    = f"${self._dashboard_balance:,.2f} USDC ({self._dashboard_balance_note})"
         lines = [
+            f"  Mode:          {mode_str}",
+            f"  Wallet:        {wallet_str}",
+            f"  Balance:       {bal_str}",
             f"  Uptime:        {h:02d}:{m:02d}:{s:02d}",
             f"  Health:        {self.health.summary}",
             f"  KillSwitch:    {self.kill_switch.summary}",
