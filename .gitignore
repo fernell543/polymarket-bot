@@ -1,5 +1,39 @@
+# Secrets — never commit
 .env
+
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.pdb
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime logs and trade data
+logs/
+*.log
+
+# Analytics outputs
+*.csv
+*.json
+!package.json
+!package-lock.json
+
+# OS artefacts
 .DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build / dist
+dist/
+build/
+*.egg-info/
