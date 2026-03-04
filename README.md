@@ -442,3 +442,127 @@ The same fields (`mode`, `wallet`, `balance_usdc`, `balance_note`) are written t
 | `logs/perf.json` | Live performance snapshot (written every 60s) — includes `mode`, `wallet`, `balance_usdc` |
 | `logs/opt_results.csv` | Parameter optimizer results (ranked configs) |
 | `logs/opt_best.json` | Top-3 configs from last optimizer run |
+| `logs/supervised_decisions.jsonl` | Append-only audit log — one JSON per supervised cycle |
+| `logs/supervised_state.json` | Current promotion phase + cycle counter |
+| `logs/deployment_plan.json` | Latest operator-review deployment plan |
+
+---
+
+## Supervised Claude Loop
+
+An operator-controlled pipeline where logs and performance data are analysed,
+candidate improvements are proposed, validated in paper mode, and only promoted
+when strict policy gates pass. **No autonomous live self-modification.**
+
+### Architecture
+
+```
+Operator triggers cycle
+        │
+        ▼
+┌──────────────────────────────────────────────────┐
+│  orchestrator.py  (agent_loop/)                  │
+│                                                  │
+│  1. Ingest   ── perf.json + quant_trades.csv     │
+│                 + opt_best.json                  │
+│                                                  │
+│  2. Propose  ── propose_patch.py                 │
+│                 (reads optimizer output;         │
+│                  Claude API hook-point)          │
+│                                                  │
+│  3. Validate ── validate.py                      │
+│                 (replay trades through params)   │
+│                                                  │
+│  4. Scorecard── scorecard.py                     │
+│                 (policy gates → decision)        │
+│                                                  │
+│  5. Plan     ── deploy.py                        │
+│                 (writes deployment_plan.json)    │
+│                 NEVER auto-applies               │
+│                                                  │
+│  6. Log      ── supervised_decisions.jsonl       │
+└──────────────────────────────────────────────────┘
+        │
+        ▼
+   Operator reviews deployment_plan.json
+   and manually applies env-var changes
+```
+
+### Policy guardrails (`agent_loop/policy.json`)
+
+Hard constraints — cannot be auto-relaxed:
+
+| Constraint | Default |
+|---|---|
+| Max daily loss | $100 USDC |
+| Max drawdown | $200 USDC |
+| Max per-market exposure | $200 USDC |
+| Max portfolio exposure | $1 000 USDC |
+| Min paper trades required | 30 |
+| Min net edge after fees+slip | 30 bps |
+| Max kill-switch tier allowed | Tier 2 (Tier 3 = REJECT) |
+
+Scorecard thresholds for promotion:
+
+| Level | Win rate | Sharpe-like | Fill ratio | Adverse sel. |
+|---|---|---|---|---|
+| `PAPER_PROMOTE` | ≥ 52% | ≥ 0.40 | ≥ 65% | ≤ 0.8% |
+| `MICRO_LIVE_PROMOTE` | ≥ 55% | ≥ 0.70 | ≥ 75% | ≤ 0.4% |
+
+### Promotion ladder
+
+```
+paper  →  micro_live  →  scale_candidate
+         (operator       (operator
+          must apply)     must sign off)
+```
+
+- **paper**: `DRY_RUN=1` — safe default, all trades simulated
+- **micro_live**: `DRY_RUN=0`, hard caps: $10/trade, $50 portfolio max
+- **scale_candidate**: raised caps — **no automation**, operator decision only
+
+### Commands
+
+```powershell
+# Run one full supervised cycle (ingest → propose → validate → scorecard → plan)
+.\run_supervised_cycle.ps1
+
+# Show the latest scorecard and recommendation
+.\run_supervised_report.ps1
+
+# Python equivalents (bash / CI)
+python -m agent_loop.orchestrator cycle
+python -m agent_loop.orchestrator report
+```
+
+**Recommended workflow:**
+
+```powershell
+# 1. Collect paper data
+.\run_paper_super.ps1          # run paper session (QUANT_MODE_ENABLED=1)
+
+# 2. Optimise parameters
+.\run_paper_optimize.ps1       # writes logs/opt_best.json
+
+# 3. Run supervised cycle
+.\run_supervised_cycle.ps1     # proposes, validates, scores, writes plan
+
+# 4. (Optional) Validate walk-forward stability
+.\run_walkforward.ps1
+
+# 5. Review plan and apply manually
+notepad logs\deployment_plan.json
+```
+
+### Safety model
+
+| What is automated | What is NOT automated |
+|---|---|
+| Reading logs and analytics | Writing to .env or config files |
+| Replaying trades through proposed params | Starting the live bot |
+| Computing scorecard and policy violations | Applying env-var changes |
+| Writing `deployment_plan.json` | Any promotion beyond micro-live |
+| Logging decisions to `supervised_decisions.jsonl` | Relaxing hard constraints |
+
+The orchestrator **never** calls `subprocess`, modifies `.env`, or writes to `config.py`.
+The only files it writes are inside `logs/`.
