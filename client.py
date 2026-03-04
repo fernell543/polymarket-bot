@@ -284,6 +284,8 @@ class PolymarketClient:
         """Return (balance_usdc, note) where note explains the source or failure reason."""
         if not config.WALLET_ADDRESS:
             return 0.0, "WALLET_ADDRESS not set"
+
+        # First try legacy HTTP endpoint.
         try:
             async with self._session.get(
                 "/balance", params={"address": config.WALLET_ADDRESS}
@@ -291,10 +293,27 @@ class PolymarketClient:
                 if resp.status == 200:
                     data = await resp.json()
                     return float(data.get("balance", 0)), "live"
-                return 0.0, f"API returned HTTP {resp.status}"
+                http_note = f"HTTP {resp.status}"
         except Exception as exc:
-            log.debug("get_balance: %s", exc)
-            return 0.0, f"API unavailable ({type(exc).__name__})"
+            http_note = f"API unavailable ({type(exc).__name__})"
+
+        # Fallback: ask py-clob-client directly for collateral balance.
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+            if self._clob_client is not None:
+                data = self._clob_client.get_balance_allowance(
+                    BalanceAllowanceParams(
+                        asset_type=AssetType.COLLATERAL,
+                        signature_type=0,
+                    )
+                )
+                bal = float(data.get("balance", 0))
+                return bal, f"clob_client ({http_note})"
+        except Exception as exc:
+            log.debug("get_balance_allowance: %s", exc)
+
+        return 0.0, http_note
 
     async def get_open_orders(self) -> list[dict]:
         """Return open orders for this wallet."""
@@ -343,14 +362,13 @@ class PolymarketClient:
             )
 
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType, Side
+            from py_clob_client.clob_types import OrderArgs, OrderType
 
-            py_side = Side.BUY if side == "BUY" else Side.SELL
             order_args = OrderArgs(
                 token_id=token_id,
                 price=round(price, 4),
                 size=size_shares,
-                side=py_side,
+                side=("BUY" if side == "BUY" else "SELL"),
             )
             signed = self._clob_client.create_order(order_args)
             resp = self._clob_client.post_order(signed, OrderType.GTC)
@@ -402,14 +420,13 @@ class PolymarketClient:
             )
 
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType, Side
+            from py_clob_client.clob_types import OrderArgs, OrderType
 
-            py_side = Side.BUY if side == "BUY" else Side.SELL
             order_args = OrderArgs(
                 token_id=token_id,
                 price=round(price, 4),
                 size=size_shares,
-                side=py_side,
+                side=("BUY" if side == "BUY" else "SELL"),
             )
             signed = self._clob_client.create_order(order_args)
             resp = self._clob_client.post_order(signed, OrderType.FOK)
