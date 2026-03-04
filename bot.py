@@ -142,10 +142,16 @@ class Bot:
         # Initial market list fetch
         await self._refresh_markets()
 
-        # Pre-fetch balance so first stats printout already shows account details
+        # Pre-fetch balance so first stats printout already shows account details.
+        # In DRY_RUN we still TRY to display real account balance, but sizing remains simulated.
         if config.DRY_RUN:
-            self._dashboard_balance = config.MM_STARTING_BALANCE
-            self._dashboard_balance_note = "simulated"
+            live_bal, live_note = await self.client.get_balance_usdc()
+            if live_bal > 0:
+                self._dashboard_balance = live_bal
+                self._dashboard_balance_note = f"{live_note}; simulated sizing={config.MM_STARTING_BALANCE:.2f}"
+            else:
+                self._dashboard_balance = config.MM_STARTING_BALANCE
+                self._dashboard_balance_note = "simulated (live balance unavailable)"
         else:
             bal, note = await self.client.get_balance_usdc()
             self._dashboard_balance = bal
@@ -486,17 +492,25 @@ class Bot:
                     await asyncio.sleep(config.MM_REBALANCE_INTERVAL)
                     continue
 
-                # Refresh balance so order sizing stays current
+                # Refresh balance so order sizing stays current.
+                # DRY_RUN: show live balance when available, but keep sizing simulated.
                 if config.DRY_RUN:
+                    live_bal, live_note = await self.client.get_balance_usdc()
+                    if live_bal > 0:
+                        self._dashboard_balance = live_bal
+                        self._dashboard_balance_note = (
+                            f"{live_note}; simulated sizing={config.MM_STARTING_BALANCE:.2f}"
+                        )
+                    else:
+                        self._dashboard_balance = config.MM_STARTING_BALANCE
+                        self._dashboard_balance_note = "simulated (live balance unavailable)"
                     bal = config.MM_STARTING_BALANCE
-                    self._dashboard_balance = bal
-                    self._dashboard_balance_note = "simulated"
                 else:
                     bal, note = await self.client.get_balance_usdc()
                     self._dashboard_balance = bal
                     self._dashboard_balance_note = note
                 self.market_maker.set_balance(bal)
-                self.sizer.set_balance(bal)   # keep sizer in sync with live balance
+                self.sizer.set_balance(bal)   # keep sizer in sync with live/sim balance
 
                 targets = await self.market_maker.select_target_markets(
                     self._markets_cache
