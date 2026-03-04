@@ -105,14 +105,14 @@ class PolymarketClient:
                 host=config.CLOB_HOST,
                 key=config.PRIVATE_KEY,
                 chain_id=config.POLYGON_CHAIN_ID,
-                signature_type=0,      # EOA wallet
+                signature_type=config.POLY_SIGNATURE_TYPE,
                 funder=config.WALLET_ADDRESS,
             )
 
             # Derive L2 API key from wallet signature
             creds = self._clob_client.create_or_derive_api_creds()
             self._clob_client.set_api_creds(creds)
-            log.info("Authenticated with Polymarket CLOB API")
+            log.info("Authenticated with Polymarket CLOB API (signature_type=%s)", config.POLY_SIGNATURE_TYPE)
         except ImportError:
             log.warning(
                 "py-clob-client not installed — order placement disabled. "
@@ -305,7 +305,7 @@ class PolymarketClient:
                 data = self._clob_client.get_balance_allowance(
                     BalanceAllowanceParams(
                         asset_type=AssetType.COLLATERAL,
-                        signature_type=0,
+                        signature_type=config.POLY_SIGNATURE_TYPE,
                     )
                 )
                 bal = float(data.get("balance", 0))

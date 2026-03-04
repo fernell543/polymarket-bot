@@ -54,6 +54,11 @@ DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
 POLYGON_CHAIN_ID = 137
 
+# Polymarket signing mode:
+# 0 = EOA wallet signs and trades directly
+# 1 = proxy/funder style (common with Polymarket account setup)
+POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
+
 # Polymarket fee is 2% of winnings
 POLYMARKET_FEE = 0.02
 
