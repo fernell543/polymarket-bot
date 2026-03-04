@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -194,9 +195,24 @@ KS_TIER1_DD_PACE_PCT    = float(os.getenv("KS_TIER1_DD_PACE_PCT", "0.20"))
 KS_TIER2_DD_PACE_PCT    = float(os.getenv("KS_TIER2_DD_PACE_PCT", "0.50"))
 KS_TIER3_DD_PACE_PCT    = float(os.getenv("KS_TIER3_DD_PACE_PCT", "0.80"))
 
+# Optional safety pin: if set, WALLET_ADDRESS must match this exact polygon/funder address.
+EXPECTED_POLYMARKET_WALLET = os.getenv("EXPECTED_POLYMARKET_WALLET", "").strip()
+
 
 def validate():
     if not PRIVATE_KEY:
         raise ValueError("PRIVATE_KEY not set in .env")
     if not WALLET_ADDRESS:
         raise ValueError("WALLET_ADDRESS not set in .env")
+
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", WALLET_ADDRESS):
+        raise ValueError(
+            "WALLET_ADDRESS must be a valid 42-char 0x... EVM address"
+        )
+
+    if EXPECTED_POLYMARKET_WALLET and (
+        WALLET_ADDRESS.lower() != EXPECTED_POLYMARKET_WALLET.lower()
+    ):
+        raise ValueError(
+            f"WALLET_ADDRESS mismatch: got {WALLET_ADDRESS}, expected {EXPECTED_POLYMARKET_WALLET}"
+        )
