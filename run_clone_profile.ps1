@@ -7,13 +7,24 @@
       - Trade frequency, size distribution, entry price ranges
       - YES/NO directional bias, market category preferences
       - Timing analysis, win/loss proxy
-      - Inferred clone parameters (price ranges, sizes, categories)
+
+    Deep analysis (new):
+      - Temporal patterns (time-of-day, day-of-week)
+      - Market duration buckets (intraday/short/medium/long/very-long)
+      - Size-scaling analysis (price vs size correlation)
+      - Streak analysis (win/loss sequences, adaptation signal)
+      - Holding-period distribution (median/p90 proxy)
+      - Archetype clustering (6 rules-based archetypes + allocation weights)
+      - Confidence-scored parameter bands (high/medium/speculative)
+      - Experiment matrix (5 ranked param sets for paper trading)
 
     Also runs the backtest evaluator to compare clone vs target metrics.
 
     Output files:
-      logs/clone_profile_<wallet>.json   — inferred parameter profile
-      logs/clone_backtest_<wallet>.json  — per-trade replay comparison
+      logs/clone_profile_<wallet>.json          — standard inferred parameter profile
+      logs/clone_profile_<wallet>_detailed.json — full deep analysis (new)
+      logs/clone_profile_<wallet>_report.md     — human-readable markdown report (new)
+      logs/clone_backtest_<wallet>.json         — per-trade replay comparison
 
 .PARAMETER Wallet
     Target Polymarket wallet address (0x...).
@@ -80,8 +91,10 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host "  Profile and backtest complete." -ForegroundColor Green
-Write-Host "  Profile: logs/clone_profile_$walletLower.json" -ForegroundColor Green
-Write-Host "  Backtest: logs/clone_backtest_$walletLower.json" -ForegroundColor Green
+Write-Host "  Standard profile:  logs/clone_profile_$walletLower.json" -ForegroundColor Green
+Write-Host "  Detailed profile:  logs/clone_profile_${walletLower}_detailed.json" -ForegroundColor Green
+Write-Host "  Markdown report:   logs/clone_profile_${walletLower}_report.md" -ForegroundColor Green
+Write-Host "  Backtest:          logs/clone_backtest_$walletLower.json" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Next: .\run_clone_paper.ps1 -Wallet $Wallet" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green

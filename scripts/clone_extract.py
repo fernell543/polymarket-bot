@@ -80,6 +80,9 @@ CSV_COLUMNS = [
     "current_value",      # positions: current market value
     "pnl_usdc",           # positions: realised/unrealised P&L
     "end_date",           # market end/resolution date
+    "start_date",         # market start/creation date
+    "market_duration_days",  # end_date - start_date in days (market lifetime)
+    "liquidity_usdc",     # total USDC liquidity in market at snapshot time
     "category",           # market category tag
     "market_slug",
     "raw_json",           # full JSON for archival
@@ -250,11 +253,24 @@ async def enrich_with_market_metadata(
         markets = data if isinstance(data, list) else data.get("data", [])
         if markets:
             m = markets[0]
+            start_date = (m.get("startDate") or m.get("start_date") or
+                          m.get("startTime") or m.get("createdAt") or "")
+            end_date   = m.get("endDate", m.get("end_date", ""))
+            # Market duration in days (end - start)
+            dur_days = _market_duration_days(start_date, end_date)
+            # Liquidity: try several field names Gamma uses
+            liquidity = _coerce_float(
+                m.get("liquidity") or m.get("liquidityNum") or
+                m.get("volume24hr") or m.get("liquidityClob") or 0
+            )
             meta_cache[cid] = {
-                "question":   m.get("question", ""),
-                "end_date":   m.get("endDate", m.get("end_date", "")),
-                "category":   _extract_category(m),
-                "market_slug": m.get("slug", m.get("marketSlug", "")),
+                "question":            m.get("question", ""),
+                "end_date":            end_date,
+                "start_date":          start_date,
+                "market_duration_days": dur_days,
+                "liquidity_usdc":      liquidity,
+                "category":            _extract_category(m),
+                "market_slug":         m.get("slug", m.get("marketSlug", "")),
             }
 
     enriched = 0
@@ -278,6 +294,22 @@ def _extract_category(market: dict) -> str:
     return "unknown"
 
 
+def _market_duration_days(start_date: str, end_date: str) -> float:
+    """Compute market lifetime in days from start_date to end_date strings."""
+    if not start_date or not end_date:
+        return 0.0
+    import datetime as _dt
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            s = _dt.datetime.strptime(start_date[:19], fmt[:len(fmt)])
+            e = _dt.datetime.strptime(end_date[:19],   fmt[:len(fmt)])
+            return max(0.0, (e - s).total_seconds() / 86400.0)
+        except (ValueError, TypeError):
+            continue
+    return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Normalisation → CSV rows
 # ---------------------------------------------------------------------------
@@ -295,48 +327,58 @@ def _normalise_trade(r: dict) -> dict:
     if size_shares == 0.0 and size_usdc > 0 and price > 0:
         size_shares = size_usdc / price
 
+    end_date   = r.get("endDate") or r.get("end_date") or meta.get("end_date", "")
+    start_date = r.get("startDate") or r.get("start_date") or meta.get("start_date", "")
     return {
-        "record_type":       "trade",
-        "timestamp":         r.get("timestamp") or r.get("createdAt") or r.get("created_at") or "",
-        "transaction_hash":  r.get("transactionHash") or r.get("transaction_hash") or "",
-        "condition_id":      r.get("market") or r.get("conditionId") or r.get("condition_id") or "",
-        "question":          r.get("question") or meta.get("question", ""),
-        "outcome":           r.get("outcome") or r.get("side_outcome") or "",
-        "side":              (r.get("side") or "").upper(),
-        "price":             price,
-        "size_shares":       size_shares,
-        "size_usdc":         size_usdc,
-        "avg_price":         "",
-        "current_value":     "",
-        "pnl_usdc":          "",
-        "end_date":          r.get("endDate") or r.get("end_date") or meta.get("end_date", ""),
-        "category":          r.get("category") or meta.get("category", "unknown"),
-        "market_slug":       r.get("slug") or r.get("marketSlug") or meta.get("market_slug", ""),
-        "raw_json":          json.dumps(r, default=str),
+        "record_type":          "trade",
+        "timestamp":            r.get("timestamp") or r.get("createdAt") or r.get("created_at") or "",
+        "transaction_hash":     r.get("transactionHash") or r.get("transaction_hash") or "",
+        "condition_id":         r.get("market") or r.get("conditionId") or r.get("condition_id") or "",
+        "question":             r.get("question") or meta.get("question", ""),
+        "outcome":              r.get("outcome") or r.get("side_outcome") or "",
+        "side":                 (r.get("side") or "").upper(),
+        "price":                price,
+        "size_shares":          size_shares,
+        "size_usdc":            size_usdc,
+        "avg_price":            "",
+        "current_value":        "",
+        "pnl_usdc":             "",
+        "end_date":             end_date,
+        "start_date":           start_date,
+        "market_duration_days": meta.get("market_duration_days", ""),
+        "liquidity_usdc":       meta.get("liquidity_usdc", ""),
+        "category":             r.get("category") or meta.get("category", "unknown"),
+        "market_slug":          r.get("slug") or r.get("marketSlug") or meta.get("market_slug", ""),
+        "raw_json":             json.dumps(r, default=str),
     }
 
 
 def _normalise_position(r: dict) -> dict:
     """Map a raw position record to CSV schema."""
     meta = r.get("_meta", {})
+    end_date   = r.get("endDate") or r.get("end_date") or meta.get("end_date", "")
+    start_date = r.get("startDate") or r.get("start_date") or meta.get("start_date", "")
     return {
-        "record_type":       "position",
-        "timestamp":         r.get("startDate") or r.get("start_date") or r.get("createdAt") or "",
-        "transaction_hash":  "",
-        "condition_id":      r.get("conditionId") or r.get("condition_id") or r.get("market") or "",
-        "question":          r.get("title") or r.get("question") or meta.get("question", ""),
-        "outcome":           r.get("outcome") or "",
-        "side":              "",
-        "price":             _coerce_float(r.get("curPrice") or r.get("cur_price") or r.get("price")),
-        "size_shares":       _coerce_float(r.get("size") or r.get("shares")),
-        "size_usdc":         _coerce_float(r.get("initialValue") or r.get("usdcSize") or r.get("amount")),
-        "avg_price":         _coerce_float(r.get("avgPrice") or r.get("avg_price")),
-        "current_value":     _coerce_float(r.get("currentValue") or r.get("value")),
-        "pnl_usdc":          _coerce_float(r.get("pnlPerShare") or r.get("pnl") or r.get("unrealized")),
-        "end_date":          r.get("endDate") or r.get("end_date") or meta.get("end_date", ""),
-        "category":          r.get("category") or meta.get("category", "unknown"),
-        "market_slug":       r.get("slug") or r.get("marketSlug") or meta.get("market_slug", ""),
-        "raw_json":          json.dumps(r, default=str),
+        "record_type":          "position",
+        "timestamp":            r.get("startDate") or r.get("start_date") or r.get("createdAt") or "",
+        "transaction_hash":     "",
+        "condition_id":         r.get("conditionId") or r.get("condition_id") or r.get("market") or "",
+        "question":             r.get("title") or r.get("question") or meta.get("question", ""),
+        "outcome":              r.get("outcome") or "",
+        "side":                 "",
+        "price":                _coerce_float(r.get("curPrice") or r.get("cur_price") or r.get("price")),
+        "size_shares":          _coerce_float(r.get("size") or r.get("shares")),
+        "size_usdc":            _coerce_float(r.get("initialValue") or r.get("usdcSize") or r.get("amount")),
+        "avg_price":            _coerce_float(r.get("avgPrice") or r.get("avg_price")),
+        "current_value":        _coerce_float(r.get("currentValue") or r.get("value")),
+        "pnl_usdc":             _coerce_float(r.get("pnlPerShare") or r.get("pnl") or r.get("unrealized")),
+        "end_date":             end_date,
+        "start_date":           start_date,
+        "market_duration_days": meta.get("market_duration_days", ""),
+        "liquidity_usdc":       meta.get("liquidity_usdc", ""),
+        "category":             r.get("category") or meta.get("category", "unknown"),
+        "market_slug":          r.get("slug") or r.get("marketSlug") or meta.get("market_slug", ""),
+        "raw_json":             json.dumps(r, default=str),
     }
 
 
