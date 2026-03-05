@@ -1327,7 +1327,7 @@ def print_report(wallet: str, profile: dict) -> None:
     print(f"  Wallet: {wallet}")
     print("=" * 66)
     print(f"  Trades:         {meta['total_trades']:,}   (positions: {meta['total_positions']:,})")
-    print(f"  Date range:     {meta['first_trade'][:10]}  →  {meta['last_trade'][:10]}  ({meta['date_span_days']:.0f} days)")
+    print(f"  Date range:     {meta['first_trade'][:10]}  ->  {meta['last_trade'][:10]}  ({meta['date_span_days']:.0f} days)")
     print(f"  Active days:    {meta['active_days']}")
     print(f"  Freq:           {freq['trades_per_day']:.2f} trades/day")
     print()

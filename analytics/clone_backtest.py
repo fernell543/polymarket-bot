@@ -358,7 +358,7 @@ def print_report(wallet: str, summary: dict, results: list[TradeResult]) -> None
         print("  — TOP 5 HIGHEST-SCORING MATCHES —")
         for r in top:
             print(f"    [{r.clone_score:.2f}] {r.outcome:3s} @ {r.actual_price:.3f}  "
-                  f"${r.actual_size_usdc:.0f}→clone${r.clone_size_usdc:.0f}  "
+                  f"${r.actual_size_usdc:.0f}->clone${r.clone_size_usdc:.0f}  "
                   f"{r.question[:40]}")
     print("=" * 62)
     print()
