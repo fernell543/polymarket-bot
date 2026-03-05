@@ -566,3 +566,122 @@ notepad logs\deployment_plan.json
 
 The orchestrator **never** calls `subprocess`, modifies `.env`, or writes to `config.py`.
 The only files it writes are inside `logs/`.
+
+---
+
+## Wallet Clone Mode
+
+Approximates the trading behavior of a public Polymarket wallet by extracting
+historical trade data, inferring behavioral rules, and running a scoring-based
+strategy that mimics the observed patterns.
+
+**Important limitations and safety warnings:**
+- This approximates *observable* public behavior only — past patterns, not intent or future plans.
+- The clone strategy is inherently speculative: past behavior is no guarantee of future outcomes.
+- Always run in paper mode (`DRY_RUN=1`) first. Validate clone vs target metrics before any live use.
+- The target wallet may have access to information, models, or judgment unavailable from public data.
+- This does not replicate the target wallet's exact algorithm — only statistically similar behavior.
+
+### Files Added
+
+| File | Description |
+|---|---|
+| `scripts/clone_extract.py` | Data collection: fetches trade/position history from Polymarket public APIs |
+| `analytics/clone_profile.py` | Behavior inference: computes size, price, timing, and bias features |
+| `analytics/clone_backtest.py` | Replay evaluator: measures how well the clone matches historical behavior |
+| `strategies/wallet_clone.py` | Clone strategy: scores live markets against inferred profile |
+| `run_clone_extract.ps1` | PowerShell script: Step 1 — data extraction |
+| `run_clone_profile.ps1` | PowerShell script: Step 2 — profile + backtest |
+| `run_clone_paper.ps1` | PowerShell script: Step 3 — paper-mode bot with clone strategy |
+
+### Workflow
+
+```
+Step 1: Extract historical data
+  → logs/clone_source_<wallet>.csv + .json
+
+Step 2: Build behavioral profile + backtest
+  → logs/clone_profile_<wallet>.json
+  → logs/clone_backtest_<wallet>.json
+
+Step 3: Run paper clone bot
+  → Logs simulated orders to logs/orders.csv
+  → All live markets scored against profile every 60s
+```
+
+### Exact Commands
+
+**PowerShell (recommended):**
+```powershell
+# Step 1: Extract (replace wallet address as needed)
+.\run_clone_extract.ps1 -Wallet 0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+
+# Step 2: Profile + backtest
+.\run_clone_profile.ps1 -Wallet 0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+
+# Step 3: Paper clone run (Ctrl+C to stop)
+.\run_clone_paper.ps1 -Wallet 0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+```
+
+**Python (bash/CI):**
+```bash
+# Step 1: Extract
+python scripts/clone_extract.py --wallet 0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+
+# Step 2: Profile
+python -m analytics.clone_profile --wallet 0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+
+# Step 3: Backtest
+python -m analytics.clone_backtest --wallet 0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+
+# Step 4: Run paper bot with clone enabled
+CLONE_ENABLED=1 \
+CLONE_WALLET=0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd \
+DRY_RUN=1 \
+python bot.py
+```
+
+### Config Flags
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLONE_ENABLED` | `0` | **Master switch** — set `1` to activate clone strategy |
+| `CLONE_WALLET` | — | Target wallet address (0x...) |
+| `CLONE_PROFILE_PATH` | auto | Explicit path to profile JSON (auto-derived from `CLONE_WALLET`) |
+| `CLONE_AGGRESSIVENESS` | `1.0` | Size multiplier: 0.5 = half size, 2.0 = double size |
+| `CLONE_SCORE_THRESHOLD` | `0.40` | Minimum composite score (0–1) to execute a trade |
+| `CLONE_MAX_OPEN_POSITIONS` | `3` | Maximum concurrent clone positions |
+| `CLONE_POLL_INTERVAL` | `60` | Seconds between market scans |
+| `CLONE_BIAS_ENABLED` | `1` | Apply YES/NO directional bias from profile |
+
+### Scoring Function
+
+Each live market is scored against the inferred profile on four dimensions:
+
+| Component | Weight | What it measures |
+|---|---|---|
+| Category match | 35% | Does the market category appear in target's top categories? |
+| Price fit | 35% | Is the current price within target's typical entry range? |
+| Timing fit | 20% | Is days-to-expiry within target's observed entry window? |
+| Bias match | 10% | Does YES/NO direction match target's directional bias? |
+
+A trade is executed when `score >= CLONE_SCORE_THRESHOLD` (default 0.40).
+
+### Backtest Metrics
+
+After running `analytics/clone_backtest.py`, the report shows:
+
+- **Match rate**: % of historical trades the clone would have also executed
+- **Size comparison**: clone median size vs target median size, total volume
+- **P&L proxy**: estimated P&L from matched trades (requires position P&L data)
+- **Hit rate proxy**: % of matched trades with positive P&L
+- **Timing**: average days-to-expiry at entry for matched trades
+
+### Safety Model
+
+| What is automated | What is NOT automated |
+|---|---|
+| Fetching public trade history from Polymarket APIs | Accessing private signals or wallet internals |
+| Scoring live markets against inferred rules | Guaranteeing profitable replication |
+| Paper mode simulated order logging | Live order placement (requires `DRY_RUN=0` explicitly) |
+| Profile persistence (JSON files) | Auto-updating profile from new data |

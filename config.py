@@ -204,6 +204,43 @@ KS_TIER3_DD_PACE_PCT    = float(os.getenv("KS_TIER3_DD_PACE_PCT", "0.80"))
 EXPECTED_POLYMARKET_WALLET = os.getenv("EXPECTED_POLYMARKET_WALLET", "").strip()
 
 
+# ===========================================================================
+# Wallet Clone Strategy
+# ===========================================================================
+# Approximates the trading behavior of a target Polymarket wallet using
+# publicly extracted trade history.  Disabled by default (safe).
+#
+# To activate:
+#   CLONE_ENABLED=1
+#   CLONE_WALLET=0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+#   (then run scripts/clone_extract.py and analytics/clone_profile.py)
+
+# Master switch — default OFF.  Must be explicitly set to activate.
+CLONE_ENABLED = os.getenv("CLONE_ENABLED", "0") == "1"
+
+# Target wallet address to approximate.
+CLONE_WALLET = os.getenv("CLONE_WALLET", "").lower()
+
+# Path to the inferred profile JSON (auto-derived from CLONE_WALLET if not set).
+CLONE_PROFILE_PATH = os.getenv("CLONE_PROFILE_PATH", "")
+
+# Size multiplier: >1 = more aggressive, <1 = more conservative (default 1.0).
+CLONE_AGGRESSIVENESS = float(os.getenv("CLONE_AGGRESSIVENESS", "1.0"))
+
+# Minimum composite score (0–1) required to open a clone position.
+# Higher = fewer but higher-conviction trades.  Default 0.40.
+CLONE_SCORE_THRESHOLD = float(os.getenv("CLONE_SCORE_THRESHOLD", "0.40"))
+
+# Maximum concurrent clone positions at any time.
+CLONE_MAX_OPEN_POSITIONS = int(os.getenv("CLONE_MAX_OPEN_POSITIONS", "3"))
+
+# Seconds between clone market scans.
+CLONE_POLL_INTERVAL = int(os.getenv("CLONE_POLL_INTERVAL", "60"))
+
+# Apply YES/NO directional bias from profile (default True).
+CLONE_BIAS_ENABLED = os.getenv("CLONE_BIAS_ENABLED", "1") == "1"
+
+
 def validate():
     if not PRIVATE_KEY:
         raise ValueError("PRIVATE_KEY not set in .env")

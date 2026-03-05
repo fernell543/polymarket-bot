@@ -30,7 +30,7 @@ from feeds.price_feed import BTCPriceFeed
 from health_state import HealthState, HealthLevel
 from risk import RiskEngine, CircuitBreakerState, PositionSizer
 from risk.kill_switch import KillSwitch
-from strategies import PriceArbStrategy, LatencyArbStrategy, MarketMakerStrategy
+from strategies import PriceArbStrategy, LatencyArbStrategy, MarketMakerStrategy, WalletCloneStrategy
 
 # ---------------------------------------------------------------------------
 # Logging — console + rotating file
@@ -84,6 +84,7 @@ class Bot:
         self.price_arb    = PriceArbStrategy(self.client)
         self.latency_arb  = LatencyArbStrategy(self.client, self.price_feed)
         self.market_maker = MarketMakerStrategy(self.client)
+        self.wallet_clone = WalletCloneStrategy(self.client)
 
         # --- Quant infrastructure (safe when QUANT_MODE_ENABLED=0) --------
         self.health        = HealthState()
@@ -95,7 +96,7 @@ class Bot:
         self._session_start: float = time.time()
 
         # Wire risk-based sizer + health state into all strategies
-        for _strat in (self.price_arb, self.latency_arb, self.market_maker):
+        for _strat in (self.price_arb, self.latency_arb, self.market_maker, self.wallet_clone):
             _strat.set_sizer(self.sizer)
             _strat.set_health(self.health)
 
@@ -178,6 +179,20 @@ class Bot:
                 name="order-timeout",
             ),
         ]
+
+        # Clone strategy — paper-safe by default (CLONE_ENABLED=0)
+        if config.CLONE_ENABLED:
+            self._tasks.append(
+                asyncio.create_task(self._wallet_clone_loop(), name="wallet-clone")
+            )
+            log.info(
+                "CLONE MODE ACTIVE — approximating wallet %s  threshold=%.2f  aggr=%.1f",
+                config.CLONE_WALLET or "(profile path set)",
+                config.CLONE_SCORE_THRESHOLD,
+                config.CLONE_AGGRESSIVENESS,
+            )
+        else:
+            log.info("Clone strategy disabled (CLONE_ENABLED=0)")
 
         if config.QUANT_MODE_ENABLED:
             log.info("QUANT MODE ENABLED — signal engine, risk engine, adaptive execution active")
@@ -528,6 +543,36 @@ class Bot:
                 log.error("MarketMaker error: %s", exc, exc_info=True)
             await asyncio.sleep(config.MM_REBALANCE_INTERVAL)
 
+    async def _wallet_clone_loop(self):
+        """Clone strategy loop — paper-safe by default (DRY_RUN=1).
+
+        Scans live markets every CLONE_POLL_INTERVAL seconds and executes
+        the highest-scoring opportunity that matches the inferred profile.
+        """
+        log.info("WalletClone loop starting (poll=%ds)", config.CLONE_POLL_INTERVAL)
+        while self._running:
+            try:
+                if not self._safe_to_trade():
+                    log.warning("WalletClone: %s", self.health.summary)
+                    await asyncio.sleep(config.CLONE_POLL_INTERVAL)
+                    continue
+                if not self.risk_engine.can_trade():
+                    log.warning("WalletClone: risk engine blocked — %s",
+                                self.risk_engine.state.summary)
+                    await asyncio.sleep(config.CLONE_POLL_INTERVAL)
+                    continue
+
+                self.wallet_clone._cycle_count += 1
+                opportunities = await self.wallet_clone.scan_once(self._markets_cache)
+                if opportunities:
+                    await self.wallet_clone.execute(opportunities[0])
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.wallet_clone._errors += 1
+                log.error("WalletClone error: %s", exc, exc_info=True)
+            await asyncio.sleep(config.CLONE_POLL_INTERVAL)
+
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
@@ -591,6 +636,8 @@ class Bot:
         ]
         if config.QUANT_MODE_ENABLED:
             lines.append(f"  Quant mode:    ACTIVE  profile={config.PARAM_PROFILE}")
+        if config.CLONE_ENABLED:
+            lines.append(f"  WalletClone:   {self.wallet_clone.stats()}")
         return "\n".join(lines)
 
 
