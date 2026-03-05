@@ -593,6 +593,7 @@ strategy that mimics the observed patterns.
 | `run_clone_extract.ps1` | PowerShell script: Step 1 — data extraction |
 | `run_clone_profile.ps1` | PowerShell script: Step 2 — profile + backtest |
 | `run_clone_paper.ps1` | PowerShell script: Step 3 — paper-mode bot with clone strategy |
+| `run_clone_hf_paper.ps1` | PowerShell script: Step 3 (HF mode) — paired YES/NO paper execution |
 
 ### Workflow
 
@@ -685,3 +686,109 @@ After running `analytics/clone_backtest.py`, the report shows:
 | Scoring live markets against inferred rules | Guaranteeing profitable replication |
 | Paper mode simulated order logging | Live order placement (requires `DRY_RUN=0` explicitly) |
 | Profile persistence (JSON files) | Auto-updating profile from new data |
+
+---
+
+## HF Hedge Mode
+
+The HF (high-frequency) hedge mode emulates high-turnover paired YES/NO execution.
+Instead of scoring single-leg opportunities against a profile, it:
+
+1. Scans for markets where **YES_ask + NO_ask falls within a configurable combined-price band**.
+2. Places **both legs simultaneously** (paired entry).
+3. If one leg fills and the other doesn't, a **hedge routine** fires with a maker→taker urgency ladder.
+4. Tracks each pair through a **per-position state machine**: `collecting → partially_filled → hedged/aborted`.
+
+### Why This Pattern
+
+When YES_ask + NO_ask < 1.00, one of the tokens is mispriced relative to the other.
+Buying both locks in the spread between the combined price and $1.00 (at expiry one token pays $1).
+The HF mode captures these tiny-edge windows at high turnover with controlled slippage risk.
+
+### State Machine
+
+```
+COLLECTING       → both legs placed, waiting for fills
+                 → PARTIALLY_FILLED: one leg filled, hedge triggered
+                 → HEDGED:           both legs filled (success)
+                 → ABORTED:          collect timeout (neither leg filled)
+
+PARTIALLY_FILLED → hedge order placed (maker)
+                 → after TAKER_FALLBACK_SECS: upgrade to taker order
+                 → HEDGED:  hedge fills successfully
+                 → ABORTED: hedge_timeout or hedge_slippage_abort
+```
+
+### Reason Codes (in logs)
+
+| Code | Meaning |
+|---|---|
+| `hf_pair_entry` | New paired position opened |
+| `partial_fill` | One leg filled; hedge triggered |
+| `hedge_maker` | Hedge placed as maker/limit order |
+| `hedge_taker` | Hedge placed as taker/market order (urgency fallback) |
+| `hedge_maker_fill` | Maker hedge filled successfully |
+| `hedge_taker_fill` | Taker hedge filled successfully |
+| `hedge_order_failed` | Hedge order placement failed |
+| `hedge_slippage_abort` | Hedge aborted — price moved > MAX_SLIPPAGE_BPS from entry |
+| `hedge_timeout` | Hedge aborted — HEDGE_TIMEOUT_SECS exceeded |
+| `collect_timeout` | Both legs timed out before filling |
+| `hedge_both_filled` | Both legs filled without needing explicit hedge |
+
+### Config Flags
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLONE_HF_MODE_ENABLED` | `0` | **HF mode switch** — requires `CLONE_ENABLED=1` |
+| `CLONE_COMBINED_PRICE_MIN` | `0.85` | Minimum YES_ask + NO_ask to enter a pair |
+| `CLONE_COMBINED_PRICE_MAX` | `0.97` | Maximum YES_ask + NO_ask to enter a pair |
+| `CLONE_HEDGE_TIMEOUT_SECS` | `30` | Abort if unfilled leg not done within N seconds |
+| `CLONE_HEDGE_TAKER_FALLBACK_SECS` | `10` | Switch maker→taker hedge after N seconds |
+| `CLONE_MAX_SLIPPAGE_BPS` | `50` | Abort hedge if price moved > N bps from entry |
+| `CLONE_CYCLE_INTERVAL_SECS` | `5` | Scan + monitor interval (vs 60s in standard mode) |
+| `CLONE_HF_MAX_POSITIONS` | `5` | Max concurrent paired positions |
+| `CLONE_MIN_DEPTH_USDC` | `100` | Per-leg minimum book depth |
+| `CLONE_HF_PAPER_SIMULATE_PARTIAL` | `0` | Set `1` to force partial fills in paper mode (tests hedge path) |
+
+### Key Metrics to Monitor
+
+Query `hf_stats()` (visible in stats log every 60s) or scan logs for `CloneHF`:
+
+| Metric | Target range | Risk signal |
+|---|---|---|
+| `hedge_success_rate` | ≥ 0.70 in paper | < 0.50 = timing/depth issue |
+| `avg_time_to_hedge_secs` | 1–15s | > 20s = taker fallback dominating |
+| `avg_net_edge_proxy` | > 0.02 | ≤ 0 = combined price band too wide |
+| Aborted / total positions | < 30% | > 50% = timeout or slippage too tight |
+| `partial_fill` events | varies | high rate with low hedge success = liquidity problem |
+
+### Commands
+
+```powershell
+# Basic paper run
+.\run_clone_hf_paper.ps1 -Wallet 0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+
+# Narrower edge band (higher conviction, fewer trades)
+.\run_clone_hf_paper.ps1 -Wallet 0x... -CombinedPriceMin 0.88 -CombinedPriceMax 0.95
+
+# Simulate partial fills to exercise the maker→taker hedge path
+.\run_clone_hf_paper.ps1 -Wallet 0x... -SimulatePartial
+
+# Faster taker fallback (aggressive hedge)
+.\run_clone_hf_paper.ps1 -Wallet 0x... -HedgeTakerFallbackSecs 5 -HedgeTimeoutSecs 20
+
+# Bash / CI equivalent
+CLONE_ENABLED=1 CLONE_HF_MODE_ENABLED=1 \
+CLONE_WALLET=0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd \
+CLONE_COMBINED_PRICE_MIN=0.85 CLONE_COMBINED_PRICE_MAX=0.97 \
+CLONE_CYCLE_INTERVAL_SECS=5 DRY_RUN=1 \
+python bot.py
+```
+
+### Fidelity Checklist Before Enabling Live
+
+- [ ] `hedge_success_rate ≥ 0.70` over ≥ 50 paper pairs
+- [ ] `avg_net_edge_proxy > 0.02` (net positive after 2× fee)
+- [ ] Aborted positions < 30% of total
+- [ ] No `hedge_slippage_abort` events with slippage > 100 bps
+- [ ] Confirm `DRY_RUN=0` + private key in `.env` before removing `DRY_RUN=1`

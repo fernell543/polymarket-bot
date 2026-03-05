@@ -240,6 +240,36 @@ CLONE_POLL_INTERVAL = int(os.getenv("CLONE_POLL_INTERVAL", "60"))
 # Apply YES/NO directional bias from profile (default True).
 CLONE_BIAS_ENABLED = os.getenv("CLONE_BIAS_ENABLED", "1") == "1"
 
+# ---------------------------------------------------------------------------
+# Clone HF Hedge Mode
+# ---------------------------------------------------------------------------
+# High-frequency paired YES/NO execution mode.  Places both legs simultaneously
+# and hedges the unfilled leg when one fills.  State machine: collecting →
+# partially_filled → hedged/aborted.  Paper-safe by default.
+#
+# Requires CLONE_ENABLED=1.  Safe defaults — enable with CLONE_HF_MODE_ENABLED=1.
+#
+# CLONE_HF_MODE_ENABLED=1           activate HF mode
+# CLONE_COMBINED_PRICE_MIN=0.85     min (YES_ask + NO_ask) to enter
+# CLONE_COMBINED_PRICE_MAX=0.97     max (YES_ask + NO_ask) to enter
+# CLONE_HEDGE_TIMEOUT_SECS=30       abort if unfilled leg not done in N secs
+# CLONE_HEDGE_TAKER_FALLBACK_SECS=10  switch to taker after N secs (< TIMEOUT)
+# CLONE_MAX_SLIPPAGE_BPS=50         abort hedge if price moved > N bps from entry
+# CLONE_CYCLE_INTERVAL_SECS=5       scan/monitor interval in HF mode
+# CLONE_HF_MAX_POSITIONS=5          max concurrent HF pair positions
+# CLONE_MIN_DEPTH_USDC=100          per-leg depth floor
+# CLONE_HF_PAPER_SIMULATE_PARTIAL=0 set 1 to simulate partial fills in paper mode
+
+CLONE_HF_MODE_ENABLED           = os.getenv("CLONE_HF_MODE_ENABLED",           "0") == "1"
+CLONE_COMBINED_PRICE_MIN        = float(os.getenv("CLONE_COMBINED_PRICE_MIN",        "0.85"))
+CLONE_COMBINED_PRICE_MAX        = float(os.getenv("CLONE_COMBINED_PRICE_MAX",        "0.97"))
+CLONE_HEDGE_TIMEOUT_SECS        = int(os.getenv("CLONE_HEDGE_TIMEOUT_SECS",          "30"))
+CLONE_HEDGE_TAKER_FALLBACK_SECS = int(os.getenv("CLONE_HEDGE_TAKER_FALLBACK_SECS",   "10"))
+CLONE_MAX_SLIPPAGE_BPS          = float(os.getenv("CLONE_MAX_SLIPPAGE_BPS",          "50.0"))
+CLONE_CYCLE_INTERVAL_SECS       = int(os.getenv("CLONE_CYCLE_INTERVAL_SECS",         "5"))
+CLONE_HF_MAX_POSITIONS          = int(os.getenv("CLONE_HF_MAX_POSITIONS",            "5"))
+CLONE_HF_MIN_DEPTH_USDC         = float(os.getenv("CLONE_MIN_DEPTH_USDC",            "100.0"))
+CLONE_HF_PAPER_SIMULATE_PARTIAL = os.getenv("CLONE_HF_PAPER_SIMULATE_PARTIAL",  "0") == "1"
 
 
 # ===========================================================================

@@ -182,15 +182,29 @@ class Bot:
 
         # Clone strategy — paper-safe by default (CLONE_ENABLED=0)
         if config.CLONE_ENABLED:
-            self._tasks.append(
-                asyncio.create_task(self._wallet_clone_loop(), name="wallet-clone")
-            )
-            log.info(
-                "CLONE MODE ACTIVE — approximating wallet %s  threshold=%.2f  aggr=%.1f",
-                config.CLONE_WALLET or "(profile path set)",
-                config.CLONE_SCORE_THRESHOLD,
-                config.CLONE_AGGRESSIVENESS,
-            )
+            if config.CLONE_HF_MODE_ENABLED:
+                self._tasks.append(
+                    asyncio.create_task(self._clone_hf_loop(), name="clone-hf")
+                )
+                log.info(
+                    "CLONE HF MODE ACTIVE — paired YES/NO execution  "
+                    "wallet=%s  combined=[%.2f,%.2f]  cycle=%ds  hedge_timeout=%ds",
+                    config.CLONE_WALLET or "(profile path set)",
+                    config.CLONE_COMBINED_PRICE_MIN,
+                    config.CLONE_COMBINED_PRICE_MAX,
+                    config.CLONE_CYCLE_INTERVAL_SECS,
+                    config.CLONE_HEDGE_TIMEOUT_SECS,
+                )
+            else:
+                self._tasks.append(
+                    asyncio.create_task(self._wallet_clone_loop(), name="wallet-clone")
+                )
+                log.info(
+                    "CLONE MODE ACTIVE — approximating wallet %s  threshold=%.2f  aggr=%.1f",
+                    config.CLONE_WALLET or "(profile path set)",
+                    config.CLONE_SCORE_THRESHOLD,
+                    config.CLONE_AGGRESSIVENESS,
+                )
         else:
             log.info("Clone strategy disabled (CLONE_ENABLED=0)")
 
@@ -573,6 +587,55 @@ class Bot:
                 log.error("WalletClone error: %s", exc, exc_info=True)
             await asyncio.sleep(config.CLONE_POLL_INTERVAL)
 
+    async def _clone_hf_loop(self):
+        """High-frequency paired YES/NO clone loop (CLONE_HF_MODE_ENABLED=1).
+
+        Runs at CLONE_CYCLE_INTERVAL_SECS (default 5s).
+        Each cycle:
+          1. monitor_hf_positions() — advance state machines for open pairs.
+          2. scan_hf_pairs()        — find new pair opportunities.
+          3. execute_hf_pair()      — open the best new pair (if capacity allows).
+        """
+        log.info(
+            "CloneHF loop starting  cycle=%ds  combined=[%.2f,%.2f]  "
+            "hedge_timeout=%ds  simulate_partial=%s",
+            config.CLONE_CYCLE_INTERVAL_SECS,
+            config.CLONE_COMBINED_PRICE_MIN,
+            config.CLONE_COMBINED_PRICE_MAX,
+            config.CLONE_HEDGE_TIMEOUT_SECS,
+            config.CLONE_HF_PAPER_SIMULATE_PARTIAL,
+        )
+        while self._running:
+            try:
+                if not self._safe_to_trade():
+                    log.warning("CloneHF: %s", self.health.summary)
+                    await asyncio.sleep(config.CLONE_CYCLE_INTERVAL_SECS)
+                    continue
+                if not self.risk_engine.can_trade():
+                    log.warning("CloneHF: risk engine blocked — %s",
+                                self.risk_engine.state.summary)
+                    await asyncio.sleep(config.CLONE_CYCLE_INTERVAL_SECS)
+                    continue
+
+                self.wallet_clone._cycle_count += 1
+
+                # Step 1: advance open HF positions
+                await self.wallet_clone.monitor_hf_positions()
+
+                # Step 2: scan for new pairs
+                pairs = await self.wallet_clone.scan_hf_pairs(self._markets_cache)
+
+                # Step 3: execute best pair if available
+                if pairs:
+                    await self.wallet_clone.execute_hf_pair(pairs[0])
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.wallet_clone._errors += 1
+                log.error("CloneHF error: %s", exc, exc_info=True)
+            await asyncio.sleep(config.CLONE_CYCLE_INTERVAL_SECS)
+
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
@@ -638,6 +701,8 @@ class Bot:
             lines.append(f"  Quant mode:    ACTIVE  profile={config.PARAM_PROFILE}")
         if config.CLONE_ENABLED:
             lines.append(f"  WalletClone:   {self.wallet_clone.stats()}")
+            if config.CLONE_HF_MODE_ENABLED:
+                lines.append(f"  CloneHF:       {self.wallet_clone.hf_stats()}")
         return "\n".join(lines)
 
 
