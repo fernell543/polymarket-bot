@@ -859,11 +859,37 @@ class WalletCloneStrategy:
         if not self._profile:
             return None
 
-        # Size
-        size_usdc = self._profile.base_size_usdc * CLONE_AGGRESSIVENESS
+        # --- Dynamic sizing via CloneSizer ---
+        from risk.clone_sizer import compute_clone_size, CLONE_SIZE_MODE
+        health_level = self._health.level if self._health else HealthLevel.NORMAL
+        # Use per-leg minimum depth as a conservative estimate
+        depth_usdc = min(pair.yes_depth_usdc, pair.no_depth_usdc)
+        avg_spread = (pair.yes_spread + pair.no_spread) / 2.0
+        csr = compute_clone_size(
+            profile    = self._profile,
+            edge_proxy = pair.edge_proxy,
+            confidence = 0.70,          # HF pairs: fixed structural confidence
+            depth_usdc = depth_usdc,
+            spread     = avg_spread,
+            health_level = health_level,
+            global_max = CLONE_LIVE_MAX_SIZE,
+        )
+        if csr.blocked or csr.size_usdc == 0:
+            log.info(
+                "CloneHF: clone-sizer blocked  pos_candidate  reason=%s  mode=%s",
+                csr.reason, CLONE_SIZE_MODE,
+            )
+            return None
+        size_usdc = csr.size_usdc
+        # Log full sizing trace for audit
+        log.info(
+            "CloneHF: size_decision  mode=%s  edge_proxy=%.4f  depth=%.0f  "
+            "spread=%.4f  size=%.2f USDC  reason=%s",
+            csr.mode, pair.edge_proxy, depth_usdc, avg_spread, size_usdc, csr.reason,
+        )
+        # Fallback to global sizer only if present (secondary guard)
         if self._sizer is not None:
             edge_bps = max(50.0, pair.edge_proxy * 10_000)
-            health_level = self._health.level if self._health else HealthLevel.NORMAL
             sr = self._sizer.compute(
                 edge_bps=edge_bps,
                 confidence=0.70,
@@ -872,13 +898,14 @@ class WalletCloneStrategy:
                 label="CloneHF",
             )
             if sr.size_usdc == 0:
-                log.info("CloneHF: sizer blocked (%s)", sr.reason)
+                log.info("CloneHF: global-sizer blocked (%s)", sr.reason)
                 return None
-            size_usdc = sr.size_usdc
+            # Use the more conservative of the two
+            size_usdc = min(size_usdc, sr.size_usdc)
 
-        size_usdc = min(size_usdc, CLONE_LIVE_MAX_SIZE)
         if size_usdc < self._profile.min_size_usdc:
-            log.debug("CloneHF: size too small (%.2f)", size_usdc)
+            log.debug("CloneHF: size too small (%.2f < profile_min=%.2f)",
+                      size_usdc, self._profile.min_size_usdc)
             return None
 
         pos_id = f"hf_{self._hf_position_counter:04d}_{uuid.uuid4().hex[:6]}"

@@ -271,6 +271,33 @@ CLONE_HF_MAX_POSITIONS          = int(os.getenv("CLONE_HF_MAX_POSITIONS",       
 CLONE_HF_MIN_DEPTH_USDC         = float(os.getenv("CLONE_MIN_DEPTH_USDC",            "100.0"))
 CLONE_HF_PAPER_SIMULATE_PARTIAL = os.getenv("CLONE_HF_PAPER_SIMULATE_PARTIAL",  "0") == "1"
 
+# ---------------------------------------------------------------------------
+# Clone dynamic sizing  (risk/clone_sizer.py)
+# ---------------------------------------------------------------------------
+# CLONE_SIZE_MODE=profile  — match target wallet size distribution
+# CLONE_SIZE_MODE=adaptive — edge/conf/liq-scaled sizing anchored at profile base
+#
+# CLONE_SIZE_MATCH_TARGET=1   try to reproduce target median + dispersion
+# CLONE_SIZE_LIQUIDITY_MULT   extra liquidity-depth scale factor (default 1.0)
+# CLONE_SIZE_MIN_USDC / MAX   override floor/ceiling regardless of profile
+CLONE_SIZE_MODE           = os.getenv("CLONE_SIZE_MODE",           "profile")
+CLONE_SIZE_MIN_USDC       = float(os.getenv("CLONE_SIZE_MIN_USDC",  "2.0"))
+CLONE_SIZE_MAX_USDC       = float(os.getenv("CLONE_SIZE_MAX_USDC", "100.0"))
+CLONE_SIZE_MATCH_TARGET   = os.getenv("CLONE_SIZE_MATCH_TARGET",   "1") == "1"
+CLONE_SIZE_LIQUIDITY_MULT = float(os.getenv("CLONE_SIZE_LIQUIDITY_MULT", "1.0"))
+
+
+# ===========================================================================
+# Supervised Controller
+# ===========================================================================
+# CONTROL_MODE=manual      (default) — reads recommendations, no auto-apply
+# CONTROL_MODE=supervised  — auto-applies param updates within allowlist bounds
+#
+# The controller NEVER touches hard risk limits, key management, or live code.
+# All applied changes are written to logs/applied_params.json and audited in
+# logs/controller_audit.jsonl.
+CONTROL_MODE = os.getenv("CONTROL_MODE", "manual")
+
 
 # ===========================================================================
 # Live Deployment Mode

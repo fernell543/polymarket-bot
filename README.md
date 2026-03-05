@@ -792,3 +792,189 @@ python bot.py
 - [ ] Aborted positions < 30% of total
 - [ ] No `hedge_slippage_abort` events with slippage > 100 bps
 - [ ] Confirm `DRY_RUN=0` + private key in `.env` before removing `DRY_RUN=1`
+
+---
+
+## Clone Dynamic Sizing
+
+The HF and standard clone strategies now use a **profile-matched dynamic sizer**
+(`risk/clone_sizer.py`) instead of a fixed base size.  Every sizing decision is
+fully logged so behavior can be audited trade-by-trade.
+
+### Two modes
+
+| Mode | Behaviour |
+|---|---|
+| `profile` (default) | Maps `edge_proxy` + `confidence` into the target wallet's observed size distribution (`min_size … max_size`). At median edge and confidence ≈ 0.70 produces roughly `profile.base_size_usdc` — reproducing the target's typical trade size. |
+| `adaptive` | Edge-scalar × confidence × liquidity multiplier anchored at `profile.base_size_usdc`. Behaves like the standard `PositionSizer` but tuned to the clone context. |
+
+### Formula (profile mode)
+
+```
+edge_norm  = clamp(edge_proxy / 0.15, 0, 1)          # 0–15 % edge saturates
+size_base  = profile.min_size + (profile.max_size - profile.min_size) × edge_norm
+size       = size_base × clamp(confidence, 0.5, 1.5) × liq_mult × spread_mult
+size       = clamp(size, CLONE_SIZE_MIN_USDC, CLONE_SIZE_MAX_USDC)
+size       = min(size, staircase_stage_cap)           # hard cap, always last
+```
+
+### Guards (size=0 if any trigger)
+
+| Guard | Condition |
+|---|---|
+| Health | `health ≥ SAFE_MODE` |
+| Edge floor | `edge_proxy × 10 000 < 30 bps` |
+| Confidence floor | `confidence < profile.confidence_floor` |
+
+### Clone sizing knobs
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLONE_SIZE_MODE` | `profile` | `profile` or `adaptive` algorithm |
+| `CLONE_SIZE_MIN_USDC` | `2.0` | Absolute floor after all logic |
+| `CLONE_SIZE_MAX_USDC` | `100.0` | Absolute ceiling before stage cap |
+| `CLONE_SIZE_MATCH_TARGET` | `1` | Honour profile min/max bounds |
+| `CLONE_SIZE_LIQUIDITY_MULT` | `1.0` | Extra depth-scaling factor |
+
+### Audit logging
+
+Every sized trade emits a structured INFO log:
+
+```
+CloneSizer: mode=profile  edge=80bps  conf=0.70  depth=500  liq=1.00  spread=0.020  → 18.50 USDC
+```
+
+The full trace (all inputs + final size) is also stored in `CloneSizeResult.inputs`
+for downstream analytics.
+
+---
+
+## Clone-Only Live-Safe Usage
+
+`run_clone_hf_live_safe.ps1` is the recommended entry point for live or near-live
+clone HF sessions.  It enforces conservative defaults and requires an explicit
+`-Live` flag + `LIVE` typed confirmation to enter real-money mode.
+
+### Key differences from the paper launcher
+
+| Feature | Paper (`run_clone_hf_paper.ps1`) | Live-safe (`run_clone_hf_live_safe.ps1`) |
+|---|---|---|
+| Default mode | `DRY_RUN=1` | `DRY_RUN=1` (paper unless `-Live` flag) |
+| Default slippage cap | 50 bps | 30 bps |
+| Default combined price band | 0.85–0.97 | 0.88–0.96 (tighter) |
+| Default max positions | 5 | 3 |
+| Size mode | fixed aggressiveness | profile-matched dynamic sizer |
+| Stage enforcement | soft | hard (SizeMaxUsdc clamped to stage cap) |
+| Live confirmation | none needed | types `LIVE` at prompt |
+| Other strategies | MM_TARGET_MARKETS=0 | MM_TARGET_MARKETS=0 |
+
+### Exact commands (live-safe)
+
+```powershell
+# Paper run with dynamic sizing (safe default)
+.\run_clone_hf_live_safe.ps1 -Wallet 0x288cfa8daae64e2e1d3ab118a9261b24f70d23bd
+
+# Paper run, adaptive sizing mode
+.\run_clone_hf_live_safe.ps1 -Wallet 0x... -SizeMode adaptive
+
+# Stage A live ($5 cap) — requires PRIVATE_KEY in env + typed confirmation
+.\run_clone_hf_live_safe.ps1 -Wallet 0x... -Stage staircase_A -Live
+
+# Stage B live ($20 cap) with custom band
+.\run_clone_hf_live_safe.ps1 -Wallet 0x... -Stage staircase_B -Live `
+    -CombinedPriceMin 0.90 -CombinedPriceMax 0.96
+
+# Conservative sizing (low liquidity multiplier)
+.\run_clone_hf_live_safe.ps1 -Wallet 0x... -SizeLiquidityMult 0.5 -SizeMaxUsdc 10
+```
+
+---
+
+## Supervised Controller
+
+`agent_loop/controller.py` is an **auto-parameter tuning loop** that reads the
+latest supervised-cycle recommendation and applies approved changes within a
+strict policy-bounded allowlist.  It adds a second layer of automation on top
+of the existing orchestrator, which only ever *proposes* changes.
+
+### Modes
+
+| `CONTROL_MODE` | Behaviour |
+|---|---|
+| `manual` (default) | Reads latest recommendation, prints it, writes **nothing**. Safe for review. |
+| `supervised` | Validates each proposed param against the allowlist bounds, writes approved values to `logs/applied_params.json`, and logs every action to `logs/controller_audit.jsonl`. |
+
+### What IS automated in supervised mode
+
+- Reading `logs/supervised_decisions.jsonl` for the latest recommendation.
+- Checking each proposed param against `agent_loop/controller_policy.json` allowlist + bounds.
+- Writing approved params to `logs/applied_params.json`.
+- Appending a full audit record (inputs, approved, rejected, previous values) to `logs/controller_audit.jsonl`.
+
+### What is NEVER automated
+
+| Always forbidden | Why |
+|---|---|
+| Editing `.env`, `config.py`, `*.py` source files | Only `applied_params.json` is written |
+| Touching `PRIVATE_KEY`, `WALLET_ADDRESS`, `DRY_RUN` | Forbidden in `controller_policy.json` |
+| Changing hard risk limits (`RISK_DAILY_LOSS_LIMIT`, `RISK_MAX_DRAWDOWN`, staircase caps) | Forbidden |
+| Starting or restarting the live bot | Operator action only |
+| Relaxing `policy.json` hard constraints | Requires manual edit + commit |
+| Live code patching | Disabled by design |
+
+### Tunable allowlist (`agent_loop/controller_policy.json`)
+
+| Parameter | Min | Max | Category |
+|---|---|---|---|
+| `SIGNAL_CONFIDENCE_THRESHOLD` | 0.25 | 0.70 | signal |
+| `EXEC_MIN_EDGE` | 0.005 | 0.030 | execution |
+| `CLONE_SCORE_THRESHOLD` | 0.30 | 0.65 | clone |
+| `CLONE_AGGRESSIVENESS` | 0.50 | 1.50 | clone |
+| `CLONE_COMBINED_PRICE_MIN` | 0.80 | 0.92 | clone_hf |
+| `CLONE_COMBINED_PRICE_MAX` | 0.93 | 0.99 | clone_hf |
+| `CLONE_SIZE_MIN_USDC` | 1.0 | 10.0 | clone_sizing |
+| `CLONE_SIZE_MAX_USDC` | 10.0 | 200.0 | clone_sizing |
+
+### Commands
+
+```powershell
+# Manual mode (read-only — prints recommendation, no writes)
+.\run_controller_cycle.ps1
+
+# Supervised mode (auto-apply within allowlist)
+.\run_controller_cycle.ps1 -Supervised
+
+# Show applied params + last audit entries
+.\run_controller_cycle.ps1 -Status
+
+# Python equivalents
+python -m agent_loop.controller run
+CONTROL_MODE=supervised python -m agent_loop.controller run
+python -m agent_loop.controller status
+```
+
+### Recommended workflow
+
+```powershell
+# 1. Collect paper data
+.\run_clone_hf_live_safe.ps1 -Wallet 0x...
+
+# 2. Run supervised cycle (ingest → propose → validate → scorecard)
+.\run_supervised_cycle.ps1
+
+# 3. Review the recommendation in manual mode
+.\run_controller_cycle.ps1
+
+# 4. If recommendation looks good, auto-apply within bounds
+.\run_controller_cycle.ps1 -Supervised
+
+# 5. Restart the bot to pick up applied_params.json
+.\run_clone_hf_live_safe.ps1 -Wallet 0x...
+```
+
+### New log files
+
+| File | Contents |
+|---|---|
+| `logs/applied_params.json` | Latest controller-applied parameter values (JSON) |
+| `logs/controller_audit.jsonl` | Append-only audit: every cycle's inputs, approved, rejected, timestamps |

@@ -1,0 +1,80 @@
+{
+  "_comment": "Supervised Controller — Tunable Allowlist and Safety Bounds. NEVER edit forbidden_params section. Hard risk limits are enforced by risk_engine regardless.",
+
+  "tunable_params": {
+    "SIGNAL_CONFIDENCE_THRESHOLD": {
+      "min": 0.25,
+      "max": 0.70,
+      "description": "Min signal confidence required to open a position",
+      "category": "signal"
+    },
+    "EXEC_MIN_EDGE": {
+      "min": 0.005,
+      "max": 0.030,
+      "description": "Min net edge (after fees + slippage) to place an order",
+      "category": "execution"
+    },
+    "CLONE_SCORE_THRESHOLD": {
+      "min": 0.30,
+      "max": 0.65,
+      "description": "Min composite score for clone opportunity entry",
+      "category": "clone"
+    },
+    "CLONE_AGGRESSIVENESS": {
+      "min": 0.50,
+      "max": 1.50,
+      "description": "Clone size multiplier (1.0 = match profile exactly)",
+      "category": "clone"
+    },
+    "CLONE_COMBINED_PRICE_MIN": {
+      "min": 0.80,
+      "max": 0.92,
+      "description": "HF pair entry band floor (YES_ask + NO_ask)",
+      "category": "clone_hf"
+    },
+    "CLONE_COMBINED_PRICE_MAX": {
+      "min": 0.93,
+      "max": 0.99,
+      "description": "HF pair entry band ceiling",
+      "category": "clone_hf"
+    },
+    "CLONE_SIZE_MIN_USDC": {
+      "min": 1.0,
+      "max": 10.0,
+      "description": "Clone sizer absolute floor per trade",
+      "category": "clone_sizing"
+    },
+    "CLONE_SIZE_MAX_USDC": {
+      "min": 10.0,
+      "max": 200.0,
+      "description": "Clone sizer absolute ceiling per trade (before stage cap)",
+      "category": "clone_sizing"
+    }
+  },
+
+  "forbidden_params": [
+    "PRIVATE_KEY",
+    "WALLET_ADDRESS",
+    "DRY_RUN",
+    "RISK_DAILY_LOSS_LIMIT",
+    "RISK_MAX_DRAWDOWN",
+    "RISK_MAX_MARKET_EXPOSURE",
+    "RISK_MAX_PORTFOLIO_EXPOSURE",
+    "LIVE_STAGE_A_MAX_SIZE_USDC",
+    "LIVE_STAGE_B_MAX_SIZE_USDC",
+    "LIVE_STAGE_C_MAX_SIZE_USDC",
+    "LIVE_STAGE_A_MAX_POSITIONS",
+    "LIVE_STAGE_B_MAX_POSITIONS",
+    "LIVE_STAGE_C_MAX_POSITIONS",
+    "EXPECTED_POLYMARKET_WALLET",
+    "POLYGON_RPC",
+    "CLOB_HOST",
+    "CONTROL_MODE",
+    "QUANT_MODE_ENABLED"
+  ],
+
+  "audit_log": "logs/controller_audit.jsonl",
+  "applied_params_file": "logs/applied_params.json",
+
+  "_note_live_code_patching": "Live code patching is DISABLED by design. The controller may only write to logs/applied_params.json. The operator must restart the bot to pick up new params."
+}
