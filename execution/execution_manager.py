@@ -1,7 +1,7 @@
 """
 Execution manager — adaptive order routing and pre-trade validation.
 ====================================================================
-Wraps PolymarketClient with three layers of execution intelligence:
+Wraps PolymarketClient with four layers of execution intelligence:
 
   1. Pre-trade edge check
      Before any order is placed, verify that expected net edge
@@ -19,15 +19,26 @@ Wraps PolymarketClient with three layers of execution intelligence:
      order that has been open longer than EXEC_ORDER_TIMEOUT_SECS.
      Timed-out orders are cancelled and can be re-quoted next cycle.
 
+  4. Live-specific controls (active when DRY_RUN=0 or LIVE_CONTROLS_ENABLED=1)
+     a) Order-rate throttle   — token-bucket, max LIVE_MAX_ORDER_RATE/min
+     b) Min-depth filter      — skip markets below LIVE_MIN_DEPTH_USDC
+     c) Spread-stability gate — reject trades when spread is widening rapidly
+     d) Avoid-chase logic     — refuse to cross spread on sudden price move
+        unless urgency exceeds LIVE_CHASE_URGENCY_OVERRIDE
+     All gated by LiveRealism (execution/live_realism.py).
+
 Gated by QUANT_MODE_ENABLED:
   - When False: edge check always passes; "LIMIT" is always chosen;
     timeout tracking still runs (safe, no harm).
   - When True : full logic active.
+
+Live controls are always active when DRY_RUN=0.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import time
 from dataclasses import dataclass
@@ -35,8 +46,20 @@ from typing import Optional
 
 import config
 from client import PolymarketClient, PlacedOrder
+from execution.live_realism import LiveRealism, RealismEstimate
 
 log = logging.getLogger(__name__)
+
+# Live controls are active in live mode OR when explicitly forced on
+_LIVE_CONTROLS = not config.DRY_RUN or (
+    os.getenv("LIVE_CONTROLS_ENABLED", "0") == "1"
+    if __import__("os").getenv("LIVE_CONTROLS_ENABLED") is not None
+    else False
+)
+
+# Resolve at import time (avoids repeated env reads in hot paths)
+import os as _os
+_LIVE_CONTROLS_ENABLED: bool = (not config.DRY_RUN) or (_os.getenv("LIVE_CONTROLS_ENABLED", "0") == "1")
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +93,6 @@ def check_edge(
     net   = gross - fee - slippage
 
     if not config.QUANT_MODE_ENABLED:
-        # In non-quant mode, always pass — existing strategies handle their
-        # own entry criteria.
         return EdgeCheckResult(ok=True, expected_edge=net, gross_edge=gross,
                                reason="quant mode disabled — edge check bypassed")
 
@@ -132,13 +153,43 @@ def choose_order_type(
 
 
 # ---------------------------------------------------------------------------
+# Token-bucket rate limiter
+# ---------------------------------------------------------------------------
+
+class _TokenBucket:
+    """
+    Simple token-bucket rate limiter.
+
+    Allows up to `rate` tokens per `period` seconds.
+    Each call to consume() takes 1 token; returns True if allowed.
+    """
+
+    def __init__(self, rate: int, period: float = 60.0) -> None:
+        self._rate   = rate
+        self._period = period
+        self._tokens = float(rate)
+        self._last   = time.monotonic()
+
+    def consume(self) -> bool:
+        now    = time.monotonic()
+        delta  = now - self._last
+        self._last = now
+        # Refill proportionally to elapsed time
+        self._tokens = min(self._rate, self._tokens + delta * (self._rate / self._period))
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return True
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Execution manager
 # ---------------------------------------------------------------------------
 
 class ExecutionManager:
     """
-    Wraps PolymarketClient with adaptive routing, edge checks, and
-    pending-order timeout management.
+    Wraps PolymarketClient with adaptive routing, edge checks, live controls,
+    and pending-order timeout management.
 
     Shared instance: create once in bot.py and pass to any strategy that
     wants the enhanced execution layer.
@@ -146,13 +197,72 @@ class ExecutionManager:
 
     def __init__(self, client: PolymarketClient):
         self.client = client
+        self.realism = LiveRealism()
+
         # order_id → monotonic timestamp of placement
         self._pending: dict[str, float] = {}
+
         # Fill-quality counters (reset never — session totals)
-        self._total_placed:   int   = 0
-        self._total_cancelled: int  = 0
+        self._total_placed:    int   = 0
+        self._total_cancelled: int   = 0
         self._last_latency_ms: float = 0.0
         self._total_latency_ms: float = 0.0
+
+        # Live controls
+        self._rate_limiter = _TokenBucket(
+            rate=config.LIVE_MAX_ORDER_RATE,
+            period=60.0,
+        )
+        # Per-token depth cache: token_id → (depth_usdc, monotonic_ts)
+        self._depth_cache: dict[str, tuple[float, float]] = {}
+
+        # signal-price cache for chase detection: token_id → (price, ts)
+        self._signal_price_cache: dict[str, tuple[float, float]] = {}
+
+    # ------------------------------------------------------------------
+    # Live-controls helpers
+    # ------------------------------------------------------------------
+
+    def _rate_limit_ok(self) -> bool:
+        """Return True if we have capacity under the order-rate budget."""
+        if not _LIVE_CONTROLS_ENABLED:
+            return True
+        if self._rate_limiter.consume():
+            return True
+        log.warning(
+            "ExecutionManager: order rate limit hit (max %d/min) — skipping",
+            config.LIVE_MAX_ORDER_RATE,
+        )
+        return False
+
+    def _depth_ok(self, token_id: str, depth_usdc: float) -> bool:
+        """Return True if market depth meets LIVE_MIN_DEPTH_USDC."""
+        if not _LIVE_CONTROLS_ENABLED:
+            return True
+        ok = depth_usdc >= config.LIVE_MIN_DEPTH_USDC
+        if not ok:
+            log.debug(
+                "ExecutionManager: depth filter — token=%s depth=%.1f < %.1f",
+                token_id[:8], depth_usdc, config.LIVE_MIN_DEPTH_USDC,
+            )
+        return ok
+
+    def record_signal_price(self, token_id: str, price: float) -> None:
+        """
+        Record the price at which a trading signal was generated.
+
+        Allows chase detection to compare signal_price vs current_price
+        when execute() is called (potentially seconds later).
+        """
+        self._signal_price_cache[token_id] = (price, time.monotonic())
+
+    def record_book_update(self, token_id: str, spread: float) -> None:
+        """
+        Notify the realism layer that a fresh book snapshot was obtained.
+        Call this whenever get_best_prices() returns a valid result.
+        """
+        self.realism.record_book_update(token_id)
+        self.realism.record_spread(token_id, spread)
 
     # ------------------------------------------------------------------
     # Main execute method
@@ -168,15 +278,17 @@ class ExecutionManager:
         urgency:     float = 0.5,   # 0=patient, 1=time-critical
         limit_price: Optional[float] = None,
         slippage:    float = 0.002,
+        depth_usdc:  float = 500.0, # estimated available depth (USDC)
     ) -> tuple[Optional[PlacedOrder], EdgeCheckResult]:
         """
-        Execute an order with full pre-trade validation.
+        Execute an order with full pre-trade validation and live controls.
 
         Returns
         -------
         (placed_order, edge_check)
-          placed_order is None if edge check fails or there is no liquidity.
+          placed_order is None if any check fails or there is no liquidity.
         """
+        # --- Fetch best prices --------------------------------------------
         bid, ask = await self.client.get_best_prices(token_id)
         price = ask if side == "BUY" else bid
 
@@ -189,8 +301,55 @@ class ExecutionManager:
 
         spread = ask - bid if ask > bid else 1.0
 
+        # Notify realism layer of fresh book data
+        self.record_book_update(token_id, spread)
+
+        # --- Live controls ------------------------------------------------
+        if _LIVE_CONTROLS_ENABLED:
+            # Rate throttle
+            if not self._rate_limit_ok():
+                ec = EdgeCheckResult(
+                    ok=False, expected_edge=0.0, gross_edge=0.0,
+                    reason="order rate limit exceeded",
+                )
+                return None, ec
+
+            # Minimum depth filter
+            if not self._depth_ok(token_id, depth_usdc):
+                ec = EdgeCheckResult(
+                    ok=False, expected_edge=0.0, gross_edge=0.0,
+                    reason=f"depth too thin: {depth_usdc:.1f} < {config.LIVE_MIN_DEPTH_USDC:.1f}",
+                )
+                return None, ec
+
+            # Spread stability
+            if not self.realism.spread_is_stable(token_id, spread):
+                ec = EdgeCheckResult(
+                    ok=False, expected_edge=0.0, gross_edge=0.0,
+                    reason="spread unstable (rapid widening detected)",
+                )
+                return None, ec
+
+            # Avoid-chase: compare vs cached signal price
+            cached = self._signal_price_cache.get(token_id)
+            signal_price = cached[0] if cached else price
+            if not self.realism.chase_allowed(signal_price, price, spread, urgency):
+                ec = EdgeCheckResult(
+                    ok=False, expected_edge=0.0, gross_edge=0.0,
+                    reason=(
+                        f"avoid-chase blocked: price moved "
+                        f"{abs(price - signal_price):.4f} from signal {signal_price:.4f}"
+                    ),
+                )
+                return None, ec
+
         # --- Pre-trade edge check -----------------------------------------
-        ec = check_edge(price, fair_value, slippage=slippage)
+        live_slip = (
+            self.realism.slippage_estimate(spread, size_usdc, depth_usdc)
+            if _LIVE_CONTROLS_ENABLED
+            else slippage
+        )
+        ec = check_edge(price, fair_value, slippage=live_slip)
         if not ec.ok:
             log.info(
                 "ExecutionManager: skipping %s %s — %s",
@@ -241,9 +400,6 @@ class ExecutionManager:
         Cancel any tracked limit orders open longer than `timeout_secs`.
 
         Returns list of order IDs that were cancelled.
-
-        Call this periodically (e.g. in the stats loop) to clean up stale
-        orders that failed to fill.
         """
         if timeout_secs is None:
             timeout_secs = float(config.EXEC_ORDER_TIMEOUT_SECS)
@@ -278,11 +434,7 @@ class ExecutionManager:
     # ------------------------------------------------------------------
 
     def fill_quality_stats(self) -> dict:
-        """
-        Return a snapshot of session-level fill-quality metrics.
-
-        Useful for the stats loop and fill_quality analytics module.
-        """
+        """Return a snapshot of session-level fill-quality metrics."""
         avg_lat = (
             self._total_latency_ms / self._total_placed
             if self._total_placed > 0 else 0.0
@@ -297,6 +449,8 @@ class ExecutionManager:
             "cancel_rate":      round(cancel_rate, 4),
             "avg_latency_ms":   round(avg_lat, 2),
             "last_latency_ms":  round(self._last_latency_ms, 2),
+            "live_controls":    _LIVE_CONTROLS_ENABLED,
+            "pending_orders":   len(self._pending),
         }
 
     # ------------------------------------------------------------------

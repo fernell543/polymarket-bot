@@ -193,9 +193,17 @@ class RiskEngine:
         return True
 
     def _refresh_state(self) -> None:
-        """Check all hard limits and update circuit breaker if needed."""
-        # Daily reset at midnight UTC
+        """
+        Check all hard limits and update circuit breaker if needed.
+
+        HARD GUARDRAILS: daily loss cap and drawdown cap are ALWAYS checked
+        regardless of QUANT_MODE_ENABLED, LIVE_DEPLOY_MODE, or any optimizer
+        override.  These limits are non-negotiable and cannot be bypassed.
+        Kill-switch Tier 3 (NO_TRADE) is also always enforced via
+        apply_to_health() in bot._kill_switch_loop().
+        """
         now_ts = time.time()
+        # Daily reset at midnight UTC
         if now_ts - self._day_start >= 86_400:
             log.info(
                 "RiskEngine: new trading day — resetting daily P&L "
@@ -211,32 +219,37 @@ class RiskEngine:
                     self._circuit_breaker = CircuitBreakerState.CLOSED
                     log.info("RiskEngine: daily circuit breaker auto-reset")
 
-        if not config.QUANT_MODE_ENABLED:
-            return
+        # ---------------------------------------------------------------
+        # HARD GUARDRAILS — always enforced, cannot be disabled by config.
+        # These run regardless of QUANT_MODE_ENABLED or deployment stage.
+        # ---------------------------------------------------------------
 
-        # Daily loss limit
+        # Hard daily loss limit
         if (
             self._daily_pnl < -config.RISK_DAILY_LOSS_LIMIT
             and self._circuit_breaker != CircuitBreakerState.OPEN
         ):
             log.error(
-                "RiskEngine: DAILY LOSS LIMIT HIT (%.2f < -%.2f) — "
-                "CIRCUIT BREAKER OPEN",
+                "RiskEngine: [HARD GUARDRAIL] DAILY LOSS LIMIT HIT "
+                "(%.2f < -%.2f) — CIRCUIT BREAKER OPEN",
                 self._daily_pnl, config.RISK_DAILY_LOSS_LIMIT,
             )
             self._circuit_breaker = CircuitBreakerState.OPEN
 
-        # Max drawdown
+        # Hard max drawdown
         if (
             self._drawdown > config.RISK_MAX_DRAWDOWN
             and self._circuit_breaker != CircuitBreakerState.OPEN
         ):
             log.error(
-                "RiskEngine: MAX DRAWDOWN HIT (%.2f > %.2f) — "
-                "CIRCUIT BREAKER OPEN",
+                "RiskEngine: [HARD GUARDRAIL] MAX DRAWDOWN HIT "
+                "(%.2f > %.2f) — CIRCUIT BREAKER OPEN",
                 self._drawdown, config.RISK_MAX_DRAWDOWN,
             )
             self._circuit_breaker = CircuitBreakerState.OPEN
+
+        if not config.QUANT_MODE_ENABLED:
+            return  # soft limits below only active in quant mode
 
     # ------------------------------------------------------------------
     # Trade recording
@@ -335,6 +348,23 @@ class RiskEngine:
     # ------------------------------------------------------------------
     # State snapshot
     # ------------------------------------------------------------------
+
+    @property
+    def guardrails_summary(self) -> str:
+        """
+        One-line summary of hard guardrail status.
+
+        These limits are always active regardless of mode or optimizer.
+        Suitable for logging in health checks and dashboard display.
+        """
+        return (
+            f"[HARD GUARDRAILS] "
+            f"daily_loss_limit=${config.RISK_DAILY_LOSS_LIMIT:.0f}  "
+            f"max_drawdown=${config.RISK_MAX_DRAWDOWN:.0f}  "
+            f"current_daily_pnl={self._daily_pnl:+.2f}  "
+            f"current_drawdown={self._drawdown:.2f}  "
+            f"CB={self._circuit_breaker.name}"
+        )
 
     @property
     def state(self) -> RiskState:

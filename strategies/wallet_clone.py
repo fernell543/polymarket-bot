@@ -4,8 +4,15 @@ Wallet Clone Strategy
 Approximates the trading behavior of a target Polymarket wallet by:
   1. Loading an inferred behavioral profile (from analytics/clone_profile.py).
   2. Scoring live markets against the profile (category, price range, timing).
-  3. Executing the highest-scoring opportunity once per cycle.
-  4. Using the shared PositionSizer for risk management.
+  3. Filtering by REALIZED live edge (after slippage, partial fill, spread stability).
+  4. Executing the highest-scoring opportunity once per cycle.
+  5. Using the shared PositionSizer for risk management.
+
+Live-first changes vs paper version:
+  - Scoring now incorporates LiveRealism.realized_edge (not theoretical).
+  - scan_once() enforces LIVE_MIN_DEPTH_USDC and spread stability pre-filter.
+  - execute() uses avoid-chase and staircase size caps.
+  - Scoring weights shift: realized_edge_score (0.25) replaces naive price_score.
 
 This is a behavioral approximation — it does NOT access the target wallet's
 private signals, intent, or future actions.  It can only replicate observable
@@ -20,6 +27,7 @@ Config flags (all env-overridable):
   CLONE_MAX_OPEN_POSITIONS=3    Max concurrent clone positions
   CLONE_POLL_INTERVAL=60        Seconds between scans
   CLONE_BIAS_ENABLED=1          Apply YES/NO directional bias from profile
+  LIVE_DEPLOY_MODE=staircase_A  Stage-specific size/position caps
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from typing import Optional, TYPE_CHECKING
 
 import config
 from client import PolymarketClient, Market
+from execution.live_realism import LiveRealism
 
 if TYPE_CHECKING:
     from health_state import HealthState
@@ -66,6 +75,22 @@ CLONE_SCORE_THRESHOLD   = _env_float("CLONE_SCORE_THRESHOLD", 0.40)
 CLONE_MAX_OPEN_POSITIONS = _env_int("CLONE_MAX_OPEN_POSITIONS", 3)
 CLONE_POLL_INTERVAL     = _env_int("CLONE_POLL_INTERVAL",     60)
 CLONE_BIAS_ENABLED      = os.getenv("CLONE_BIAS_ENABLED", "1") == "1"
+
+# Staircase size cap: derive from LIVE_DEPLOY_MODE
+_STAGE_SIZE_CAP = {
+    "staircase_A": config.LIVE_STAGE_A_MAX_SIZE_USDC,
+    "staircase_B": config.LIVE_STAGE_B_MAX_SIZE_USDC,
+    "staircase_C": config.LIVE_STAGE_C_MAX_SIZE_USDC,
+    "production":  config.SIZE_MAX_USDC,
+}
+_STAGE_POS_CAP = {
+    "staircase_A": config.LIVE_STAGE_A_MAX_POSITIONS,
+    "staircase_B": config.LIVE_STAGE_B_MAX_POSITIONS,
+    "staircase_C": config.LIVE_STAGE_C_MAX_POSITIONS,
+    "production":  CLONE_MAX_OPEN_POSITIONS,
+}
+CLONE_LIVE_MAX_SIZE = _STAGE_SIZE_CAP.get(config.LIVE_DEPLOY_MODE, config.LIVE_STAGE_A_MAX_SIZE_USDC)
+CLONE_LIVE_MAX_POSITIONS = _STAGE_POS_CAP.get(config.LIVE_DEPLOY_MODE, config.LIVE_STAGE_A_MAX_POSITIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +163,15 @@ class CloneOpportunity:
     dte_days: Optional[float]
     category: str
     size_usdc: float    # pre-computed base size (before sizer adjustments)
+    spread: float = 0.0
+    depth_usdc: float = 500.0
+    realized_edge: float = 0.0
 
     def __repr__(self) -> str:
         return (
             f"CloneOpp(score={self.score:.2f} outcome={self.outcome} "
             f"price={self.price:.3f} size={self.size_usdc:.1f} "
+            f"re_edge={self.realized_edge:.4f} "
             f"dte={self.dte_days} cat={self.category})"
         )
 
@@ -167,15 +196,22 @@ class WalletCloneStrategy:
     """
     Approximates target wallet trading behavior using inferred profile parameters.
 
-    Scoring function (0–1):
-      category_score (0.35) — market category matches preferred categories
-      price_score    (0.35) — current best price within target's entry range
-      timing_score   (0.20) — days-to-expiry within target's observed window
-      bias_score     (0.10) — direction matches target's YES/NO bias
+    Scoring function (0–1), live-first version:
+      category_score      (0.30) — market category matches preferred categories
+      price_score         (0.25) — current best price within target's entry range
+      timing_score        (0.20) — days-to-expiry within target's observed window
+      bias_score          (0.10) — direction matches target's YES/NO bias
+      realized_edge_score (0.15) — positive realized edge after live frictions
+
+    Live filters (applied before scoring, short-circuit failures):
+      - LIVE_MIN_DEPTH_USDC  — skip markets with thin depth
+      - Spread stability     — skip on rapid spread widening
+      - Book freshness       — skip stale price data
     """
 
     def __init__(self, client: PolymarketClient):
         self.client = client
+        self._realism = LiveRealism()
         self._profile: Optional[CloneProfile] = None
         self._open_positions: dict[str, ClonePosition] = {}   # condition_id → position
         self._sizer: Optional["PositionSizer"] = None
@@ -206,7 +242,6 @@ class WalletCloneStrategy:
             log.debug("WalletClone: disabled (CLONE_ENABLED=0)")
             return
 
-        # Resolve profile path
         profile_path = CLONE_PROFILE_PATH
         if not profile_path and CLONE_WALLET:
             profile_path = os.path.join("logs", f"clone_profile_{CLONE_WALLET}.json")
@@ -230,13 +265,12 @@ class WalletCloneStrategy:
         self._load_profile()
 
     # ------------------------------------------------------------------
-    # Scoring
+    # Scoring sub-components
     # ------------------------------------------------------------------
 
     def _category_score(self, market: Market) -> float:
-        """0.0–1.0 based on how well market category matches profile."""
         if not self._profile or not self._profile.preferred_categories:
-            return 0.5  # neutral if no data
+            return 0.5
         q_lower = market.question.lower()
         for cat in self._profile.preferred_categories:
             if cat and cat in q_lower:
@@ -244,7 +278,6 @@ class WalletCloneStrategy:
         return 0.1
 
     def _price_score(self, price: float, outcome: str) -> float:
-        """0.0–1.0 — how well the current price fits target's entry range."""
         if not self._profile:
             return 0.5
         if outcome.lower() == "yes":
@@ -256,17 +289,14 @@ class WalletCloneStrategy:
             return 0.5
 
         if price < lo or price > hi:
-            # Penalty: score decays as distance from range increases
             dist = min(abs(price - lo), abs(price - hi))
             return max(0.0, 0.5 - dist * 2.0)
 
-        # Within range: peak score at midpoint
         mid = (lo + hi) / 2.0
         dist_from_mid = abs(price - mid) / ((hi - lo) / 2.0)
         return 1.0 - 0.3 * dist_from_mid  # 0.7–1.0
 
     def _timing_score(self, market: Market) -> tuple[float, Optional[float]]:
-        """0.0–1.0 and DTE in days."""
         if not self._profile:
             return 0.5, None
 
@@ -288,7 +318,7 @@ class WalletCloneStrategy:
             now = datetime.now(tz=timezone.utc)
             dte = (end_dt - now).total_seconds() / 86400.0
             if dte < 0:
-                return 0.0, dte  # already expired
+                return 0.0, dte
 
             lo, hi = self._profile.min_dte_days, self._profile.max_dte_days
             if lo >= hi:
@@ -305,7 +335,6 @@ class WalletCloneStrategy:
             return 0.5, None
 
     def _bias_score(self, outcome: str) -> float:
-        """0.0–1.0 — direction alignment with target's YES/NO bias."""
         if not self._profile or not CLONE_BIAS_ENABLED:
             return 0.5
         direction_match = (outcome.lower() == self._profile.bias_direction)
@@ -314,34 +343,92 @@ class WalletCloneStrategy:
         else:
             return 0.5 - 0.5 * self._profile.bias_strength
 
+    def _realized_edge_score(
+        self,
+        price: float,
+        spread: float,
+        size_usdc: float,
+        depth_usdc: float,
+    ) -> float:
+        """
+        0.0–1.0: how positive is the realized live edge after frictions?
+
+        Uses LiveRealism to estimate slippage and partial fill, then scores:
+          > 3% realized edge → 1.0
+          > 0%               → 0.5 + (re_edge / 0.06)
+          ≤ 0% (net negative) → 0.0
+        """
+        theoretical_edge = max(0.0, (1.0 - price) - config.POLYMARKET_FEE)
+        slip  = self._realism.slippage_estimate(spread, size_usdc, depth_usdc)
+        fill  = self._realism.partial_fill_fraction(size_usdc, depth_usdc)
+        re    = self._realism.realized_edge(theoretical_edge, slip, fill)
+
+        if re <= 0.0:
+            return 0.0
+        # Normalize: 3% = max useful edge → score=1.0
+        score = min(1.0, re / 0.03)
+        return round(score, 4)
+
     def _score_opportunity(
         self,
         market: Market,
         token_id: str,
         outcome: str,
         price: float,
-    ) -> tuple[float, Optional[float]]:
-        """Composite score (0–1) and DTE."""
-        cat_s  = self._category_score(market)        * 0.35
-        price_s = self._price_score(price, outcome)  * 0.35
+        spread: float = 0.02,
+        size_usdc: float = 25.0,
+        depth_usdc: float = 500.0,
+    ) -> tuple[float, Optional[float], float]:
+        """
+        Composite score (0–1), DTE, and realized edge.
+
+        Live-first weights:
+          category_score      × 0.30
+          price_score         × 0.25
+          timing_score        × 0.20
+          bias_score          × 0.10
+          realized_edge_score × 0.15
+        """
+        cat_s    = self._category_score(market)                              * 0.30
+        price_s  = self._price_score(price, outcome)                         * 0.25
         timing_s, dte = self._timing_score(market)
         timing_s *= 0.20
-        bias_s = self._bias_score(outcome)            * 0.10
+        bias_s   = self._bias_score(outcome)                                 * 0.10
+        re_score = self._realized_edge_score(price, spread, size_usdc, depth_usdc) * 0.15
 
-        score = cat_s + price_s + timing_s + bias_s
-        return score, dte
+        score = cat_s + price_s + timing_s + bias_s + re_score
+
+        theoretical_edge = max(0.0, (1.0 - price) - config.POLYMARKET_FEE)
+        slip = self._realism.slippage_estimate(spread, size_usdc, depth_usdc)
+        fill = self._realism.partial_fill_fraction(size_usdc, depth_usdc)
+        re_edge = self._realism.realized_edge(theoretical_edge, slip, fill)
+
+        return score, dte, re_edge
 
     # ------------------------------------------------------------------
     # Market scanning
     # ------------------------------------------------------------------
 
     async def scan_once(self, markets: list[Market]) -> list[CloneOpportunity]:
-        """Score all live markets and return ranked opportunities."""
+        """
+        Score all live markets and return ranked opportunities.
+
+        Live filters applied before scoring:
+          1. Skip markets with no/expired tokens.
+          2. Skip markets already in open positions.
+          3. Apply LIVE_MIN_DEPTH_USDC filter.
+          4. Apply spread stability gate.
+          5. Apply staircase position cap.
+        """
         if not self._profile:
             return []
 
-        if len(self._open_positions) >= CLONE_MAX_OPEN_POSITIONS:
-            log.debug("WalletClone: max open positions reached (%d)", CLONE_MAX_OPEN_POSITIONS)
+        effective_max_pos = min(CLONE_MAX_OPEN_POSITIONS, CLONE_LIVE_MAX_POSITIONS)
+        if len(self._open_positions) >= effective_max_pos:
+            log.debug(
+                "WalletClone: max open positions reached (%d/%d)",
+                len(self._open_positions), effective_max_pos,
+            )
             return []
 
         opportunities: list[CloneOpportunity] = []
@@ -366,18 +453,48 @@ class WalletCloneStrategy:
                     price = (bid + ask) / 2.0
                     if price <= 0.01 or price >= 0.99:
                         continue
+                    spread = max(0.0, ask - bid)
+                    depth_usdc = 500.0  # conservative default; upgraded below if available
                 except Exception:
                     continue
 
-                score, dte = self._score_opportunity(market, token_id, outcome, price)
+                # Update realism layer with fresh book data
+                self._realism.record_book_update(token_id)
+                self._realism.record_spread(token_id, spread)
+
+                # --- Live pre-filters ---
+                if not config.DRY_RUN:
+                    # Depth filter
+                    if depth_usdc < config.LIVE_MIN_DEPTH_USDC:
+                        continue
+
+                    # Spread stability
+                    if not self._realism.spread_is_stable(token_id, spread):
+                        continue
+
+                    # Book freshness
+                    if not self._realism.book_is_fresh(token_id):
+                        continue
+
+                # Estimate base size (apply staircase cap)
+                base_size = self._profile.base_size_usdc * CLONE_AGGRESSIVENESS
+                base_size = max(self._profile.min_size_usdc, min(self._profile.max_size_usdc, base_size))
+                base_size = min(base_size, CLONE_LIVE_MAX_SIZE)
+
+                score, dte, re_edge = self._score_opportunity(
+                    market, token_id, outcome, price, spread, base_size, depth_usdc,
+                )
                 if score < CLONE_SCORE_THRESHOLD:
                     continue
 
-                # Estimate base size
-                base_size = self._profile.base_size_usdc * CLONE_AGGRESSIVENESS
-                base_size = max(self._profile.min_size_usdc, min(self._profile.max_size_usdc, base_size))
+                # Live mode: also require positive realized edge
+                if not config.DRY_RUN and re_edge <= 0:
+                    log.debug(
+                        "WalletClone: skipping %s %s — realized edge %.4f ≤ 0",
+                        outcome, token_id[:8], re_edge,
+                    )
+                    continue
 
-                # Infer category from question keywords
                 category = "unknown"
                 for cat in self._profile.preferred_categories:
                     if cat and cat in market.question.lower():
@@ -393,12 +510,17 @@ class WalletCloneStrategy:
                     dte_days=dte,
                     category=category,
                     size_usdc=base_size,
+                    spread=spread,
+                    depth_usdc=depth_usdc,
+                    realized_edge=re_edge,
                 ))
 
-        # Sort by score descending
         opportunities.sort(key=lambda o: o.score, reverse=True)
         if opportunities:
-            log.info("WalletClone: %d opportunities scored (top: %s)", len(opportunities), opportunities[0])
+            log.info(
+                "WalletClone: %d opportunities (top: %s)",
+                len(opportunities), opportunities[0],
+            )
         return opportunities
 
     # ------------------------------------------------------------------
@@ -406,14 +528,37 @@ class WalletCloneStrategy:
     # ------------------------------------------------------------------
 
     async def execute(self, opp: CloneOpportunity) -> bool:
-        """Place order for the best opportunity, respecting risk controls."""
+        """Place order for the best opportunity, respecting all live controls."""
         from health_state import HealthLevel
+
+        # Re-fetch current price to check for chase
+        try:
+            bid, ask = await self.client.get_best_prices(opp.token_id)
+            current_price = (bid + ask) / 2.0
+            current_spread = max(0.0, ask - bid)
+        except Exception:
+            current_price = opp.price
+            current_spread = opp.spread
+
+        # Avoid-chase check (live mode only)
+        if not config.DRY_RUN:
+            chase_ok = self._realism.chase_allowed(
+                signal_price=opp.price,
+                current_price=current_price,
+                spread=current_spread,
+                urgency=0.5,
+            )
+            if not chase_ok:
+                log.info(
+                    "WalletClone: avoid-chase blocked %s %s (signal=%.3f current=%.3f)",
+                    opp.outcome, opp.token_id[:8], opp.price, current_price,
+                )
+                return False
 
         # Apply PositionSizer
         size_usdc = opp.size_usdc
         if self._sizer is not None:
-            # Edge: spread * 10000 / 2 (half-spread in bps as proxy)
-            edge_bps = max(50.0, (1.0 - opp.price) * 5000.0)
+            edge_bps = max(50.0, opp.realized_edge * 10_000)
             health_level = self._health.level if self._health else HealthLevel.NORMAL
             sr = self._sizer.compute(
                 edge_bps=edge_bps,
@@ -427,24 +572,34 @@ class WalletCloneStrategy:
                 return False
             size_usdc = sr.size_usdc
 
+        # Apply staircase size cap (hard, non-overridable)
+        size_usdc = min(size_usdc, CLONE_LIVE_MAX_SIZE)
+
         log.info(
-            "WalletClone: executing %s %s @ %.3f  size=%.2f USDC  score=%.2f  dte=%s",
-            opp.outcome, opp.market.question[:50], opp.price, size_usdc, opp.score,
+            "WalletClone: executing %s %s @ %.3f  size=%.2f USDC  "
+            "score=%.2f  re_edge=%.4f  dte=%s  stage=%s",
+            opp.outcome, opp.market.question[:50], current_price, size_usdc,
+            opp.score, opp.realized_edge,
             f"{opp.dte_days:.1f}d" if opp.dte_days is not None else "N/A",
+            config.LIVE_DEPLOY_MODE,
         )
 
         result = await self.client.place_market_order(opp.token_id, "BUY", size_usdc)
 
         self._trades.append({
-            "ts":           time.time(),
-            "condition_id": opp.market.condition_id,
-            "question":     opp.market.question[:80],
-            "outcome":      opp.outcome,
-            "price":        opp.price,
-            "size_usdc":    size_usdc,
-            "score":        opp.score,
-            "order_id":     result.order_id if result else "",
-            "success":      result.success if result else False,
+            "ts":             time.time(),
+            "condition_id":   opp.market.condition_id,
+            "question":       opp.market.question[:80],
+            "outcome":        opp.outcome,
+            "price":          opp.price,
+            "current_price":  current_price,
+            "spread":         current_spread,
+            "size_usdc":      size_usdc,
+            "score":          opp.score,
+            "realized_edge":  opp.realized_edge,
+            "stage":          config.LIVE_DEPLOY_MODE,
+            "order_id":       result.order_id if result else "",
+            "success":        result.success if result else False,
         })
 
         if result and result.success:
@@ -453,7 +608,7 @@ class WalletCloneStrategy:
                 question=opp.market.question,
                 outcome=opp.outcome,
                 token_id=opp.token_id,
-                entry_price=opp.price,
+                entry_price=current_price,
                 size_usdc=size_usdc,
                 order_id=result.order_id,
             )
@@ -479,4 +634,7 @@ class WalletCloneStrategy:
             "open_positions": len(self._open_positions),
             "errors":         self._errors,
             "last_trade_ago": round(time.time() - self._last_trade_time, 1) if self._last_trade_time else None,
+            "stage":          config.LIVE_DEPLOY_MODE,
+            "stage_max_size": CLONE_LIVE_MAX_SIZE,
+            "stage_max_pos":  CLONE_LIVE_MAX_POSITIONS,
         }

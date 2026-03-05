@@ -241,6 +241,77 @@ CLONE_POLL_INTERVAL = int(os.getenv("CLONE_POLL_INTERVAL", "60"))
 CLONE_BIAS_ENABLED = os.getenv("CLONE_BIAS_ENABLED", "1") == "1"
 
 
+
+# ===========================================================================
+# Live Deployment Mode
+# ===========================================================================
+# Controls live-specific execution frictions and throttles.
+# Conservative defaults; override in .env to tune aggressiveness.
+#
+# Stages (used by scripts/live_staircase.py):
+#   staircase_A — tiny-size validation ($5 max, 3 positions)
+#   staircase_B — small-size scaling  ($20 max, 5 positions)
+#   staircase_C — scale candidate     ($50 max, 10 positions)
+#   production  — full deployment     (SIZE_MAX_USDC, unrestricted positions)
+
+LIVE_DEPLOY_MODE = os.getenv("LIVE_DEPLOY_MODE", "staircase_A")
+
+# Max orders per minute (token-bucket throttle, shared across all strategies).
+# Hard cap prevents runaway loops from hammering the API.
+LIVE_MAX_ORDER_RATE = int(os.getenv("LIVE_MAX_ORDER_RATE", "10"))
+
+# Minimum market depth (sum of top-N bid+ask levels, USDC) to allow entry.
+# Markets thinner than this have unpredictable fill rates and high slippage.
+LIVE_MIN_DEPTH_USDC = float(os.getenv("LIVE_MIN_DEPTH_USDC", "100.0"))
+
+# Spread stability window: require that spread has not changed >X% in last Y secs.
+LIVE_SPREAD_STABILITY_SECS = int(os.getenv("LIVE_SPREAD_STABILITY_SECS", "5"))
+LIVE_SPREAD_MAX_MOVE_PCT = float(os.getenv("LIVE_SPREAD_MAX_MOVE_PCT", "0.50"))  # 50% spread-widening allowed
+
+# Avoid-chase: if price has moved more than this fraction of spread since signal,
+# block the trade unless urgency exceeds LIVE_CHASE_URGENCY_OVERRIDE.
+LIVE_CHASE_MAX_MOVE_SPREADS = float(os.getenv("LIVE_CHASE_MAX_MOVE_SPREADS", "1.5"))
+LIVE_CHASE_URGENCY_OVERRIDE = float(os.getenv("LIVE_CHASE_URGENCY_OVERRIDE", "0.92"))
+
+# Slippage model parameters (used by execution/live_realism.py).
+# realized_slip = SLIP_BASE + spread * SLIP_SPREAD_FACTOR + (size/$100) * SLIP_IMPACT_FACTOR
+LIVE_SLIP_BASE           = float(os.getenv("LIVE_SLIP_BASE",           "0.001"))  # 10 bps baseline
+LIVE_SLIP_SPREAD_FACTOR  = float(os.getenv("LIVE_SLIP_SPREAD_FACTOR",  "0.30"))   # 30% of spread
+LIVE_SLIP_IMPACT_FACTOR  = float(os.getenv("LIVE_SLIP_IMPACT_FACTOR",  "0.001"))  # per $100 notional
+
+# Partial-fill model: fraction of size assumed to fill immediately.
+# Conservative: assume only this fraction of depth available on top level.
+LIVE_DEPTH_FILL_FRACTION = float(os.getenv("LIVE_DEPTH_FILL_FRACTION", "0.50"))   # 50% of top depth
+
+# Cancel/replace latency budget (ms): if cancel+repost round-trip exceeds this,
+# the stale-quote cost exceeds the spread benefit — skip re-quoting.
+LIVE_CANCEL_REPLACE_BUDGET_MS = int(os.getenv("LIVE_CANCEL_REPLACE_BUDGET_MS", "500"))
+
+# Book staleness: refuse to trade if best-price data is older than this (secs).
+LIVE_BOOK_STALE_SECS = int(os.getenv("LIVE_BOOK_STALE_SECS", "10"))
+
+# Staircase stage size/position limits (applied as hard caps, non-overridable by optimizer).
+LIVE_STAGE_A_MAX_SIZE_USDC    = float(os.getenv("LIVE_STAGE_A_MAX_SIZE_USDC",   "5.0"))
+LIVE_STAGE_A_MAX_POSITIONS    = int(os.getenv("LIVE_STAGE_A_MAX_POSITIONS",      "3"))
+LIVE_STAGE_A_MIN_TRADES_GATE  = int(os.getenv("LIVE_STAGE_A_MIN_TRADES_GATE",    "5"))
+LIVE_STAGE_A_MAX_LOSS_GATE    = float(os.getenv("LIVE_STAGE_A_MAX_LOSS_GATE",   "10.0"))
+LIVE_STAGE_A_MIN_FILL_RATE_GATE = float(os.getenv("LIVE_STAGE_A_MIN_FILL_RATE_GATE", "0.65"))
+
+LIVE_STAGE_B_MAX_SIZE_USDC    = float(os.getenv("LIVE_STAGE_B_MAX_SIZE_USDC",  "20.0"))
+LIVE_STAGE_B_MAX_POSITIONS    = int(os.getenv("LIVE_STAGE_B_MAX_POSITIONS",     "5"))
+LIVE_STAGE_B_MIN_TRADES_GATE  = int(os.getenv("LIVE_STAGE_B_MIN_TRADES_GATE",  "10"))
+LIVE_STAGE_B_MAX_LOSS_GATE    = float(os.getenv("LIVE_STAGE_B_MAX_LOSS_GATE",  "40.0"))
+LIVE_STAGE_B_MIN_FILL_RATE_GATE = float(os.getenv("LIVE_STAGE_B_MIN_FILL_RATE_GATE", "0.70"))
+LIVE_STAGE_B_MIN_SHARPE_GATE  = float(os.getenv("LIVE_STAGE_B_MIN_SHARPE_GATE", "0.40"))
+
+LIVE_STAGE_C_MAX_SIZE_USDC    = float(os.getenv("LIVE_STAGE_C_MAX_SIZE_USDC",  "50.0"))
+LIVE_STAGE_C_MAX_POSITIONS    = int(os.getenv("LIVE_STAGE_C_MAX_POSITIONS",    "10"))
+LIVE_STAGE_C_MIN_TRADES_GATE  = int(os.getenv("LIVE_STAGE_C_MIN_TRADES_GATE",  "20"))
+LIVE_STAGE_C_MAX_LOSS_GATE    = float(os.getenv("LIVE_STAGE_C_MAX_LOSS_GATE", "100.0"))
+LIVE_STAGE_C_MIN_FILL_RATE_GATE = float(os.getenv("LIVE_STAGE_C_MIN_FILL_RATE_GATE", "0.75"))
+LIVE_STAGE_C_MIN_SHARPE_GATE  = float(os.getenv("LIVE_STAGE_C_MIN_SHARPE_GATE", "0.60"))
+
+
 def validate():
     if not PRIVATE_KEY:
         raise ValueError("PRIVATE_KEY not set in .env")
