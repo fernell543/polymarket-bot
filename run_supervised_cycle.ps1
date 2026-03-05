@@ -1,24 +1,3 @@
-<#
-.SYNOPSIS
-    Run one supervised improvement cycle.
-
-.DESCRIPTION
-    Ingests analytics from logs/, proposes parameter changes (via optimizer output),
-    replays trades through proposed params, computes a scorecard, and outputs a
-    promotion decision (REJECT / PAPER_PROMOTE / MICRO_LIVE_PROMOTE).
-
-    Safe by design:
-      - No automatic deployment to live trading.
-      - All decisions written to logs/supervised_decisions.jsonl.
-      - Operator must review logs/deployment_plan.json before acting.
-
-.PARAMETER Verbose
-    Print extra debug output from the orchestrator.
-
-.EXAMPLE
-    .\run_supervised_cycle.ps1
-    .\run_supervised_cycle.ps1 -Verbose
-#>
 param(
     [switch]$Verbose
 )
@@ -28,13 +7,12 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Polymarket Bot — Supervised Improvement Cycle" -ForegroundColor Cyan
+Write-Host "  Polymarket Bot - Supervised Improvement Cycle" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Safety: no auto-deploy to live. Operator review required." -ForegroundColor Yellow
 Write-Host ""
 
-# Activate venv if present
 $venvActivate = Join-Path $ScriptDir ".venv\Scripts\Activate.ps1"
 if (Test-Path $venvActivate) {
     & $venvActivate
@@ -43,13 +21,11 @@ if (Test-Path $venvActivate) {
 
 $env:PYTHONPATH = $ScriptDir
 
-# Ensure required log directory exists
 $logsDir = Join-Path $ScriptDir "logs"
 if (-not (Test-Path $logsDir)) {
     New-Item -ItemType Directory -Path $logsDir | Out-Null
 }
 
-# Run cycle
 if ($Verbose) {
     python -m agent_loop.orchestrator cycle --verbose
 } else {
