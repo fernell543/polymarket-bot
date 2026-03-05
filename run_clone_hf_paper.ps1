@@ -77,6 +77,9 @@ $env:CLONE_CYCLE_INTERVAL_SECS       = "$CycleIntervalSecs"
 $env:CLONE_HF_MAX_POSITIONS          = "$MaxPositions"
 $env:CLONE_HF_PAPER_SIMULATE_PARTIAL = $(if ($SimulatePartial) { "1" } else { "0" })
 
+# Isolate HF clone behavior: disable market-maker order spam during clone tuning
+$env:MM_TARGET_MARKETS               = "0"
+
 try {
     python bot.py
 } finally {
@@ -85,7 +88,8 @@ try {
         "CLONE_AGGRESSIVENESS", "CLONE_COMBINED_PRICE_MIN", "CLONE_COMBINED_PRICE_MAX",
         "CLONE_HEDGE_TIMEOUT_SECS", "CLONE_HEDGE_TAKER_FALLBACK_SECS",
         "CLONE_MAX_SLIPPAGE_BPS", "CLONE_CYCLE_INTERVAL_SECS",
-        "CLONE_HF_MAX_POSITIONS", "CLONE_HF_PAPER_SIMULATE_PARTIAL"
+        "CLONE_HF_MAX_POSITIONS", "CLONE_HF_PAPER_SIMULATE_PARTIAL",
+        "MM_TARGET_MARKETS"
     )
     foreach ($v in $hfVars) {
         Remove-Item "Env:\$v" -ErrorAction SilentlyContinue
