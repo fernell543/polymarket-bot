@@ -6,8 +6,24 @@ load_dotenv()
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")
-CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
+
+# Accept CLOB_HOST or POLYMARKET_HOST (steroid-bot compat alias).
+CLOB_HOST = (
+    os.getenv("CLOB_HOST")
+    or os.getenv("POLYMARKET_HOST")
+    or "https://clob.polymarket.com"
+)
+
 POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
+
+# Polymarket "funder" address — the proxy wallet that funds positions.
+# In a standard Polymarket account this differs from the signing key's address.
+# Accepts POLY_FUNDER or FUNDER (steroid-bot compat); falls back to WALLET_ADDRESS.
+POLY_FUNDER = (
+    os.getenv("POLY_FUNDER")
+    or os.getenv("FUNDER")
+    or WALLET_ADDRESS
+)
 
 MAX_POSITION_USDC = float(os.getenv("MAX_POSITION_USDC", "500"))
 ARB_MIN_PROFIT_PCT = float(os.getenv("ARB_MIN_PROFIT_PCT", "0.03"))
@@ -56,8 +72,9 @@ POLYGON_CHAIN_ID = 137
 
 # Polymarket signing mode:
 # 0 = EOA wallet signs and trades directly
-# 1 = proxy/funder style (common with Polymarket account setup)
-POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
+# 1 = Gnosis-safe / magic proxy style
+# 2 = API-key derived from proxy/funder (proven working in steroid bot)
+POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "2"))
 
 # Polymarket fee is 2% of winnings
 POLYMARKET_FEE = 0.02

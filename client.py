@@ -39,6 +39,61 @@ def _log_order_csv(order_type, side, token_id, price, size_usdc, size_shares, or
 log = logging.getLogger(__name__)
 
 
+def _normalize_api_creds(x):
+    """Coerce whatever create_or_derive_api_creds() returns into ApiCreds.
+
+    Handles three shapes returned by different py-clob-client versions:
+      • already an ApiCreds object  → return as-is
+      • dict with various key names → map to ApiCreds fields
+      • generic object with attrs   → map attrs to ApiCreds fields
+    Raises ValueError if required fields cannot be found.
+    """
+    try:
+        from py_clob_client.clob_types import ApiCreds
+    except ImportError:
+        raise RuntimeError("py-clob-client not installed")
+
+    if isinstance(x, ApiCreds):
+        return x
+
+    if isinstance(x, dict):
+        api_key = (
+            x.get("api_key") or x.get("apiKey")
+            or x.get("key") or x.get("apiKeyId")
+        )
+        api_secret = (
+            x.get("api_secret") or x.get("apiSecret") or x.get("secret")
+        )
+        api_passphrase = (
+            x.get("api_passphrase") or x.get("apiPassphrase") or x.get("passphrase")
+        )
+        if not (api_key and api_secret and api_passphrase):
+            raise ValueError(
+                f"_normalize_api_creds: missing fields in dict keys={list(x.keys())}"
+            )
+        return ApiCreds(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+        )
+
+    # Generic object fallback
+    api_key = getattr(x, "api_key", None) or getattr(x, "apiKey", None)
+    api_secret = getattr(x, "api_secret", None) or getattr(x, "apiSecret", None)
+    api_passphrase = (
+        getattr(x, "api_passphrase", None) or getattr(x, "apiPassphrase", None)
+    )
+    if not (api_key and api_secret and api_passphrase):
+        raise ValueError(
+            "_normalize_api_creds: could not extract fields from returned object"
+        )
+    return ApiCreds(
+        api_key=api_key,
+        api_secret=api_secret,
+        api_passphrase=api_passphrase,
+    )
+
+
 @dataclass
 class Market:
     condition_id: str
@@ -96,28 +151,61 @@ class PolymarketClient:
             await self._session.close()
 
     def _init_clob_client(self):
-        """Initialise the signing client from py-clob-client."""
+        """Initialise the signing client from py-clob-client.
+
+        Uses the auth flow proven by the steroid bot:
+          1. ClobClient with signature_type=2 + explicit funder address
+          2. Derive L2 API key via create_or_derive_api_creds()
+          3. Normalize the result (handles dict / object / ApiCreds shapes)
+          4. set_api_creds(); fall back to direct .api_creds assignment on error
+        """
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
-
-            self._clob_client = ClobClient(
-                host=config.CLOB_HOST,
-                key=config.PRIVATE_KEY,
-                chain_id=config.POLYGON_CHAIN_ID,
-                signature_type=config.POLY_SIGNATURE_TYPE,
-                funder=config.WALLET_ADDRESS,
-            )
-
-            # Derive L2 API key from wallet signature
-            creds = self._clob_client.create_or_derive_api_creds()
-            self._clob_client.set_api_creds(creds)
-            log.info("Authenticated with Polymarket CLOB API (signature_type=%s)", config.POLY_SIGNATURE_TYPE)
         except ImportError:
             log.warning(
                 "py-clob-client not installed — order placement disabled. "
                 "Run: pip install py-clob-client"
             )
+            return
+
+        # Log the derived bot address (safe — no secrets in output).
+        try:
+            from eth_account import Account
+            bot_addr = (
+                Account.from_key(config.PRIVATE_KEY).address
+                if config.PRIVATE_KEY else "MISSING_PRIVATE_KEY"
+            )
+        except Exception:
+            bot_addr = "UNKNOWN"
+        log.info("Bot wallet address: %s", bot_addr)
+        log.info(
+            "Auth: signature_type=%s  funder=%s",
+            config.POLY_SIGNATURE_TYPE, config.POLY_FUNDER or "(=WALLET_ADDRESS)",
+        )
+
+        self._clob_client = ClobClient(
+            host=config.CLOB_HOST,
+            key=config.PRIVATE_KEY,
+            chain_id=config.POLYGON_CHAIN_ID,
+            signature_type=config.POLY_SIGNATURE_TYPE,
+            funder=config.POLY_FUNDER,
+        )
+
+        # Derive L2 API key; normalize whichever shape is returned.
+        raw_creds = self._clob_client.create_or_derive_api_creds()
+        creds = _normalize_api_creds(raw_creds)
+
+        # Preferred: set_api_creds(); fallback: direct attribute (older SDK versions).
+        try:
+            self._clob_client.set_api_creds(creds)
+        except Exception as exc:
+            log.debug("set_api_creds() raised %s — assigning directly", exc)
+            self._clob_client.api_creds = creds
+
+        log.info(
+            "Authenticated with Polymarket CLOB API (signature_type=%s, creds=%s)",
+            config.POLY_SIGNATURE_TYPE, bool(getattr(self._clob_client, "api_creds", None)),
+        )
 
     # ------------------------------------------------------------------
     # Market data (no auth required)
