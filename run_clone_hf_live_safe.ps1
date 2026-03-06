@@ -1,17 +1,22 @@
 param(
     [string]$Wallet = $env:CLONE_WALLET,
-    [double]$CombinedPriceMin = 0.88,
-    [double]$CombinedPriceMax = 0.96,
+    [double]$CombinedPriceMin = 0.82,
+    [double]$CombinedPriceMax = 0.94,
     [int]$HedgeTimeoutSecs = 30,
     [int]$HedgeTakerFallbackSecs = 10,
     [double]$MaxSlippageBps = 30.0,
     [int]$CycleIntervalSecs = 5,
     [int]$MaxPositions = 3,
-    [string]$SizeMode = "profile",
+    [string]$SizeMode = "adaptive",
     [double]$SizeMinUsdc = 2.0,
-    [double]$SizeMaxUsdc = 20.0,
+    [double]$SizeMaxUsdc = 5.0,
     [double]$SizeLiquidityMult = 0.8,
     [string]$Stage = "staircase_A",
+    # Adaptive gate fallback knobs
+    [int]$FallbackAfterNEmpty = 5,
+    [double]$FallbackBandWiden = 0.04,
+    [double]$FallbackDepthMult = 0.5,
+    [switch]$Preflight,
     [switch]$Live
 )
 
@@ -73,6 +78,33 @@ if ($Live) {
     $modeLabel = "LIVE (DRY_RUN=0)"
 }
 
+# --- Optional preflight diagnostic ---
+if ($Preflight) {
+    Write-Host ""
+    Write-Host "Running preflight diagnostic..." -ForegroundColor Cyan
+    $env:CLONE_WALLET = $Wallet
+    $env:CLONE_PROFILE_PATH = $profilePath
+    $env:CLONE_ENABLED = "1"
+    $env:CLONE_HF_MODE_ENABLED = "1"
+    $env:CLONE_COMBINED_PRICE_MIN = "$CombinedPriceMin"
+    $env:CLONE_COMBINED_PRICE_MAX = "$CombinedPriceMax"
+    $env:LIVE_DEPLOY_MODE = $Stage
+    $env:DRY_RUN = $dryRun
+    python -m scripts.hf_preflight
+    $preflightExit = $LASTEXITCODE
+    foreach ($v in @("CLONE_WALLET","CLONE_PROFILE_PATH","CLONE_ENABLED","CLONE_HF_MODE_ENABLED",
+                     "CLONE_COMBINED_PRICE_MIN","CLONE_COMBINED_PRICE_MAX","LIVE_DEPLOY_MODE","DRY_RUN")) {
+        Remove-Item "Env:\$v" -ErrorAction SilentlyContinue
+    }
+    if ($preflightExit -ne 0) {
+        Write-Host "PREFLIGHT FAILED — fix the above issues before launching." -ForegroundColor Red
+        Write-Host "Tip: run 'python -m scripts.hf_preflight' to diagnose." -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "Preflight passed — proceeding to launch." -ForegroundColor Green
+    Write-Host ""
+}
+
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "  POLYMARKET CLONE HF - LIVE SAFE LAUNCHER" -ForegroundColor Cyan
 Write-Host "  Wallet:   $Wallet" -ForegroundColor Cyan
@@ -82,6 +114,7 @@ Write-Host "  Timeout:  ${HedgeTimeoutSecs}s / fallback ${HedgeTakerFallbackSecs
 Write-Host "  Slippage: ${MaxSlippageBps} bps" -ForegroundColor Cyan
 Write-Host "  Max pos:  $MaxPositions" -ForegroundColor Cyan
 Write-Host "  Size:     mode=$SizeMode range=[$SizeMinUsdc,$SizeMaxUsdc] liqMult=$SizeLiquidityMult" -ForegroundColor Cyan
+Write-Host "  Fallback: after=${FallbackAfterNEmpty} empty scans  widen=+-${FallbackBandWiden}  depth_mult=${FallbackDepthMult}" -ForegroundColor Cyan
 Write-Host "  Mode:     $modeLabel" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Cyan
 
@@ -113,12 +146,17 @@ $env:CLONE_SIZE_LIQUIDITY_MULT = "$SizeLiquidityMult"
 $env:MM_TARGET_MARKETS = "0"
 $env:CLONE_HF_PAPER_SIMULATE_PARTIAL = "0"
 
+$env:CLONE_HF_FALLBACK_AFTER_N_EMPTY = "$FallbackAfterNEmpty"
+$env:CLONE_HF_FALLBACK_BAND_WIDEN    = "$FallbackBandWiden"
+$env:CLONE_HF_FALLBACK_DEPTH_MULT    = "$FallbackDepthMult"
+
 $allVars = @(
 "CLONE_ENABLED","CLONE_HF_MODE_ENABLED","CLONE_WALLET","CLONE_PROFILE_PATH","LIVE_DEPLOY_MODE",
 "CLONE_COMBINED_PRICE_MIN","CLONE_COMBINED_PRICE_MAX","CLONE_HEDGE_TIMEOUT_SECS","CLONE_HEDGE_TAKER_FALLBACK_SECS",
 "CLONE_MAX_SLIPPAGE_BPS","CLONE_CYCLE_INTERVAL_SECS","CLONE_HF_MAX_POSITIONS",
 "CLONE_SIZE_MODE","CLONE_SIZE_MIN_USDC","CLONE_SIZE_MAX_USDC","CLONE_SIZE_MATCH_TARGET","CLONE_SIZE_LIQUIDITY_MULT",
-"MM_TARGET_MARKETS","CLONE_HF_PAPER_SIMULATE_PARTIAL"
+"MM_TARGET_MARKETS","CLONE_HF_PAPER_SIMULATE_PARTIAL",
+"CLONE_HF_FALLBACK_AFTER_N_EMPTY","CLONE_HF_FALLBACK_BAND_WIDEN","CLONE_HF_FALLBACK_DEPTH_MULT"
 )
 
 try {

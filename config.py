@@ -271,6 +271,15 @@ CLONE_HF_MAX_POSITIONS          = int(os.getenv("CLONE_HF_MAX_POSITIONS",       
 CLONE_HF_MIN_DEPTH_USDC         = float(os.getenv("CLONE_MIN_DEPTH_USDC",            "100.0"))
 CLONE_HF_PAPER_SIMULATE_PARTIAL = os.getenv("CLONE_HF_PAPER_SIMULATE_PARTIAL",  "0") == "1"
 
+# Adaptive gate fallback for scan_hf_pairs().
+# After CLONE_HF_FALLBACK_AFTER_N_EMPTY consecutive empty scans the band widens
+# by ±CLONE_HF_FALLBACK_BAND_WIDEN and depth relaxes to CLONE_HF_FALLBACK_DEPTH_MULT
+# of the normal floor.  The edge floor in compute_clone_size() still blocks
+# sub-threshold trades, so the fallback cannot cause over-aggressive entry.
+CLONE_HF_FALLBACK_AFTER_N_EMPTY = int(os.getenv("CLONE_HF_FALLBACK_AFTER_N_EMPTY", "5"))
+CLONE_HF_FALLBACK_BAND_WIDEN    = float(os.getenv("CLONE_HF_FALLBACK_BAND_WIDEN",  "0.03"))
+CLONE_HF_FALLBACK_DEPTH_MULT    = float(os.getenv("CLONE_HF_FALLBACK_DEPTH_MULT",  "0.50"))
+
 # ---------------------------------------------------------------------------
 # Clone dynamic sizing  (risk/clone_sizer.py)
 # ---------------------------------------------------------------------------

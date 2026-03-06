@@ -90,6 +90,13 @@ CLONE_HF_MAX_POSITIONS          = _env_int("CLONE_HF_MAX_POSITIONS",            
 CLONE_HF_MIN_DEPTH_USDC         = _env_float("CLONE_MIN_DEPTH_USDC",            100.0)
 CLONE_HF_PAPER_SIMULATE_PARTIAL = os.getenv("CLONE_HF_PAPER_SIMULATE_PARTIAL",  "0") == "1"
 
+# Adaptive gate fallback — after N consecutive empty scans, temporarily widen
+# the combined-price band and relax depth threshold to aid candidate discovery.
+# The edge floor in compute_clone_size() still blocks low-edge opportunities.
+CLONE_HF_FALLBACK_AFTER_N_EMPTY = _env_int("CLONE_HF_FALLBACK_AFTER_N_EMPTY",   5)
+CLONE_HF_FALLBACK_BAND_WIDEN    = _env_float("CLONE_HF_FALLBACK_BAND_WIDEN",   0.03)
+CLONE_HF_FALLBACK_DEPTH_MULT    = _env_float("CLONE_HF_FALLBACK_DEPTH_MULT",   0.50)
+
 # Staircase size cap: derive from LIVE_DEPLOY_MODE
 _STAGE_SIZE_CAP = {
     "staircase_A": config.LIVE_STAGE_A_MAX_SIZE_USDC,
@@ -312,6 +319,22 @@ class WalletCloneStrategy:
         self._hf_aborted: int = 0
         self._hf_time_to_hedge: list[float] = []
         self._hf_net_edge_samples: list[float] = []
+
+        # HF scan telemetry counters (lifetime accumulated totals)
+        self._hf_scan_stats: dict[str, int] = {
+            "markets_scanned":       0,
+            "filtered_inactive":     0,
+            "filtered_already_open": 0,
+            "filtered_no_tokens":    0,
+            "filtered_price_invalid": 0,
+            "filtered_combined_band": 0,
+            "filtered_depth":        0,
+            "filtered_live_spread":  0,
+            "passed_candidates":     0,
+        }
+        # Adaptive fallback tracking
+        self._hf_consecutive_empty: int = 0
+        self._hf_fallback_active: bool = False
 
         self._load_profile()
 
@@ -748,14 +771,51 @@ class WalletCloneStrategy:
             if pos.state in (HFState.COLLECTING, HFState.PARTIALLY_FILLED)
         }
 
+        # --- Adaptive gate fallback ---
+        # After N consecutive empty scans, widen the combined-price band and
+        # relax the depth threshold to improve candidate discovery.
+        # The edge floor in compute_clone_size() still blocks sub-floor trades.
+        if self._hf_consecutive_empty >= CLONE_HF_FALLBACK_AFTER_N_EMPTY:
+            eff_price_min = max(0.60, CLONE_COMBINED_PRICE_MIN - CLONE_HF_FALLBACK_BAND_WIDEN)
+            eff_price_max = min(0.99, CLONE_COMBINED_PRICE_MAX + CLONE_HF_FALLBACK_BAND_WIDEN)
+            eff_depth     = CLONE_HF_MIN_DEPTH_USDC * CLONE_HF_FALLBACK_DEPTH_MULT
+            if not self._hf_fallback_active:
+                log.warning(
+                    "CloneHF [FALLBACK]: %d empty scans → widening band "
+                    "[%.3f,%.3f]→[%.3f,%.3f]  depth %.0f→%.0f",
+                    self._hf_consecutive_empty,
+                    CLONE_COMBINED_PRICE_MIN, CLONE_COMBINED_PRICE_MAX,
+                    eff_price_min, eff_price_max,
+                    CLONE_HF_MIN_DEPTH_USDC, eff_depth,
+                )
+                self._hf_fallback_active = True
+        else:
+            eff_price_min = CLONE_COMBINED_PRICE_MIN
+            eff_price_max = CLONE_COMBINED_PRICE_MAX
+            eff_depth     = CLONE_HF_MIN_DEPTH_USDC
+            if self._hf_fallback_active:
+                log.info(
+                    "CloneHF [FALLBACK]: deactivated — back to normal band [%.3f,%.3f]",
+                    CLONE_COMBINED_PRICE_MIN, CLONE_COMBINED_PRICE_MAX,
+                )
+                self._hf_fallback_active = False
+
+        # Per-cycle counters (accumulated into lifetime stats at the end)
+        scan_n = scan_inactive = scan_open = scan_tokens = 0
+        scan_price = scan_band = scan_depth = scan_spread = scan_passed = 0
+
         pairs: list[HFPairOpportunity] = []
 
         for market in markets:
+            scan_n += 1
             if market.closed or not market.active:
+                scan_inactive += 1
                 continue
             if market.condition_id in open_cids:
+                scan_open += 1
                 continue
             if not market.tokens or len(market.tokens) < 2:
+                scan_tokens += 1
                 continue
 
             # Find YES and NO tokens
@@ -768,11 +828,13 @@ class WalletCloneStrategy:
                     no_token = tok
 
             if not yes_token or not no_token:
+                scan_tokens += 1
                 continue
 
             yes_token_id = yes_token.get("token_id", "")
             no_token_id  = no_token.get("token_id", "")
             if not yes_token_id or not no_token_id:
+                scan_tokens += 1
                 continue
 
             # Fetch best prices for both legs
@@ -780,17 +842,21 @@ class WalletCloneStrategy:
                 yes_bid, yes_ask = await self.client.get_best_prices(yes_token_id)
                 no_bid,  no_ask  = await self.client.get_best_prices(no_token_id)
             except Exception:
+                scan_price += 1
                 continue
 
             if yes_ask <= 0.01 or yes_ask >= 0.99:
+                scan_price += 1
                 continue
             if no_ask  <= 0.01 or no_ask  >= 0.99:
+                scan_price += 1
                 continue
 
             combined_ask = yes_ask + no_ask
 
-            # Combined-price band filter
-            if combined_ask < CLONE_COMBINED_PRICE_MIN or combined_ask > CLONE_COMBINED_PRICE_MAX:
+            # Combined-price band filter (uses effective band from fallback logic)
+            if combined_ask < eff_price_min or combined_ask > eff_price_max:
+                scan_band += 1
                 continue
 
             yes_spread = max(0.0, yes_ask - yes_bid)
@@ -800,8 +866,9 @@ class WalletCloneStrategy:
             yes_depth_usdc = 500.0
             no_depth_usdc  = 500.0
 
-            # Per-leg depth filter
-            if yes_depth_usdc < CLONE_HF_MIN_DEPTH_USDC or no_depth_usdc < CLONE_HF_MIN_DEPTH_USDC:
+            # Per-leg depth filter (uses effective depth from fallback logic)
+            if yes_depth_usdc < eff_depth or no_depth_usdc < eff_depth:
+                scan_depth += 1
                 continue
 
             # Update realism layer
@@ -818,9 +885,11 @@ class WalletCloneStrategy:
                     or not self._realism.book_is_fresh(yes_token_id)
                     or not self._realism.book_is_fresh(no_token_id)
                 ):
+                    scan_spread += 1
                     continue
 
             edge_proxy = 1.0 - combined_ask - 2.0 * config.POLYMARKET_FEE
+            scan_passed += 1
 
             pairs.append(HFPairOpportunity(
                 market         = market,
@@ -838,9 +907,36 @@ class WalletCloneStrategy:
                 edge_proxy     = edge_proxy,
             ))
 
+        # Accumulate into lifetime scan stats
+        self._hf_scan_stats["markets_scanned"]       += scan_n
+        self._hf_scan_stats["filtered_inactive"]      += scan_inactive
+        self._hf_scan_stats["filtered_already_open"]  += scan_open
+        self._hf_scan_stats["filtered_no_tokens"]     += scan_tokens
+        self._hf_scan_stats["filtered_price_invalid"] += scan_price
+        self._hf_scan_stats["filtered_combined_band"] += scan_band
+        self._hf_scan_stats["filtered_depth"]         += scan_depth
+        self._hf_scan_stats["filtered_live_spread"]   += scan_spread
+        self._hf_scan_stats["passed_candidates"]      += scan_passed
+
         pairs.sort(key=lambda p: p.edge_proxy, reverse=True)
+
+        # Per-cycle telemetry line — always emitted so gating is visible in logs
+        log.info(
+            "CloneHF [SCAN] scanned=%d  inactive=%d  open=%d  no_tokens=%d  "
+            "price_invalid=%d  band_miss=%d  depth=%d  live_spread=%d  "
+            "passed=%d  fallback=%s  band=[%.3f,%.3f]",
+            scan_n, scan_inactive, scan_open, scan_tokens,
+            scan_price, scan_band, scan_depth, scan_spread,
+            scan_passed, self._hf_fallback_active,
+            eff_price_min, eff_price_max,
+        )
+
         if pairs:
+            self._hf_consecutive_empty = 0
             log.info("CloneHF: %d pair opportunities (top: %s)", len(pairs), pairs[0])
+        else:
+            self._hf_consecutive_empty += 1
+
         return pairs
 
     # ------------------------------------------------------------------
@@ -883,7 +979,7 @@ class WalletCloneStrategy:
         size_usdc = csr.size_usdc
         # Log full sizing trace for audit
         log.info(
-            "CloneHF: size_decision  mode=%s  edge_proxy=%.4f  depth=%.0f  "
+            "CloneHF [SIZING] mode=%s  edge_proxy=%.4f  depth=%.0f  "
             "spread=%.4f  size=%.2f USDC  reason=%s",
             csr.mode, pair.edge_proxy, depth_usdc, avg_spread, size_usdc, csr.reason,
         )
@@ -1242,16 +1338,21 @@ class WalletCloneStrategy:
             if self._hf_net_edge_samples else 0.0
         )
         return {
-            "hf_mode_enabled":        CLONE_HF_MODE_ENABLED,
-            "active_hf_positions":    len(self._hf_positions),
-            "hedge_success":          self._hf_hedge_success,
-            "aborted":                self._hf_aborted,
-            "hedge_success_rate":     round(h_rate, 3),
-            "avg_time_to_hedge_secs": round(avg_t2h, 2),
-            "avg_net_edge_proxy":     round(avg_edge, 4),
-            "combined_price_band":    f"[{CLONE_COMBINED_PRICE_MIN},{CLONE_COMBINED_PRICE_MAX}]",
-            "cycle_interval_secs":    CLONE_CYCLE_INTERVAL_SECS,
-            "simulate_partial":       CLONE_HF_PAPER_SIMULATE_PARTIAL,
+            "hf_mode_enabled":          CLONE_HF_MODE_ENABLED,
+            "active_hf_positions":      len(self._hf_positions),
+            "hedge_success":            self._hf_hedge_success,
+            "aborted":                  self._hf_aborted,
+            "hedge_success_rate":       round(h_rate, 3),
+            "avg_time_to_hedge_secs":   round(avg_t2h, 2),
+            "avg_net_edge_proxy":       round(avg_edge, 4),
+            "combined_price_band":      f"[{CLONE_COMBINED_PRICE_MIN},{CLONE_COMBINED_PRICE_MAX}]",
+            "cycle_interval_secs":      CLONE_CYCLE_INTERVAL_SECS,
+            "simulate_partial":         CLONE_HF_PAPER_SIMULATE_PARTIAL,
+            # Scan telemetry — shows exactly where candidates are being gated
+            "scan_telemetry":           dict(self._hf_scan_stats),
+            "consecutive_empty_scans":  self._hf_consecutive_empty,
+            "fallback_active":          self._hf_fallback_active,
+            "fallback_after_n_empty":   CLONE_HF_FALLBACK_AFTER_N_EMPTY,
         }
 
     # ------------------------------------------------------------------
