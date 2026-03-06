@@ -166,12 +166,10 @@ class Bot:
         )
 
         # Spawn all async tasks
+        clone_hf_only = bool(config.CLONE_ENABLED and config.CLONE_HF_MODE_ENABLED)
         self._tasks = [
             asyncio.create_task(self._market_refresh_loop(), name="market-refresh"),
             asyncio.create_task(self.price_feed.run(),       name="price-feed"),
-            asyncio.create_task(self._price_arb_loop(),      name="price-arb"),
-            asyncio.create_task(self._latency_arb_loop(),    name="latency-arb"),
-            asyncio.create_task(self._market_maker_loop(),   name="market-maker"),
             asyncio.create_task(self._stats_loop(),          name="stats"),
             asyncio.create_task(self._kill_switch_loop(),    name="kill-switch"),
             asyncio.create_task(
@@ -179,6 +177,15 @@ class Bot:
                 name="order-timeout",
             ),
         ]
+
+        if clone_hf_only:
+            log.info("Clone HF only mode: classic strategies disabled (PriceArb/LatencyArb/MarketMaker)")
+        else:
+            self._tasks.extend([
+                asyncio.create_task(self._price_arb_loop(),      name="price-arb"),
+                asyncio.create_task(self._latency_arb_loop(),    name="latency-arb"),
+                asyncio.create_task(self._market_maker_loop(),   name="market-maker"),
+            ])
 
         # Clone strategy — paper-safe by default (CLONE_ENABLED=0)
         if config.CLONE_ENABLED:
