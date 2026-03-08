@@ -161,6 +161,19 @@ class PolymarketClient:
         """
         try:
             from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+
+            self._clob_client = ClobClient(
+                host=config.CLOB_HOST,
+                key=config.PRIVATE_KEY,
+                chain_id=config.POLYGON_CHAIN_ID,
+                signature_type=0,      # EOA wallet
+            )
+
+            # Derive L2 API key from wallet signature
+            creds = self._clob_client.create_or_derive_api_creds()
+            self._clob_client.set_api_creds(creds)
+            log.info("Authenticated with Polymarket CLOB API")
         except ImportError:
             log.warning(
                 "py-clob-client not installed — order placement disabled. "
