@@ -104,7 +104,6 @@ class PolymarketClient:
                 key=config.PRIVATE_KEY,
                 chain_id=config.POLYGON_CHAIN_ID,
                 signature_type=0,      # EOA wallet
-                funder=config.WALLET_ADDRESS,
             )
 
             # Derive L2 API key from wallet signature
