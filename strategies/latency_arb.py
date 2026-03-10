@@ -1,12 +1,12 @@
 """
 Latency Arbitrage Strategy
 ==========================
-Polymarket's 15-minute BTC price markets resolve based on the BTC/USD price
+Polymarket's 15-minute crypto price markets resolve based on the spot price
 at a fixed point in time (e.g. "Will BTC be above $95,000 at 3:15 PM?").
 
 This strategy:
-  1. Discovers active BTC threshold markets about to resolve.
-  2. Compares the LIVE spot price (from BTCPriceFeed) to the threshold.
+  1. Discovers active BTC/ETH/SOL/XRP threshold markets about to resolve.
+  2. Compares the LIVE spot price (from CryptoPriceFeed) to the threshold.
   3. If the outcome looks certain (>= CERTAINTY_THRESHOLD probability) but
      the market price hasn't fully updated, enters a position.
 
@@ -19,20 +19,21 @@ Detection heuristics
   - Question contains phrases like "above $X" or "below $X" at a time.
   - We parse the threshold and resolution time from the question text.
   - We only enter with <= WINDOW_SECS seconds remaining.
-  - We only enter if spot price distance from threshold >= CERTAINTY_GAP_PCT.
+  - We only enter if spot price distance from threshold >= CERTAINTY_GAP_PCT
+    (time-adjusted: relaxes as expiry approaches).
 """
 
 import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
 import config
 from client import PolymarketClient, Market
-from feeds.price_feed import BTCPriceFeed
+from feeds.price_feed import CryptoPriceFeed
 
 if TYPE_CHECKING:
     from health_state import HealthState
@@ -40,17 +41,23 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# How far BTC must be from the threshold (as % of threshold) to consider
-# the outcome "certain". E.g. 0.005 = 0.5% away = $475 on a $95k BTC.
-CERTAINTY_GAP_PCT = 0.005
+# Supported crypto assets → Binance WebSocket symbol
+_CRYPTO_KEYWORDS: dict[str, str] = {
+    "btc": "btcusdt",
+    "bitcoin": "btcusdt",
+    "eth": "ethusdt",
+    "ethereum": "ethusdt",
+    "sol": "solusdt",
+    "solana": "solusdt",
+    "xrp": "xrpusdt",
+    "ripple": "xrpusdt",
+}
 
-# Only act when this many seconds or fewer remain.
+# Module-level constants read from config (env-overridable — Bug 1 fix applied)
 WINDOW_SECS = config.LATENCY_ARB_WINDOW_SECS
-
-# Minimum token price discount vs fair value (1.0) to consider profitable.
 MIN_DISCOUNT = config.LATENCY_ARB_MIN_DISCOUNT
 
-# Patterns to parse BTC threshold markets
+# Patterns to parse crypto threshold markets
 # Matches: "Will BTC be above $95,000 at 3:15 PM?" or "...below $90000..."
 _THRESHOLD_RE = re.compile(
     r"(?P<direction>above|below)\s+\$(?P<threshold>[\d,]+)",
@@ -63,18 +70,23 @@ _TIME_RE = re.compile(
 
 
 @dataclass
-class BTCMarket:
+class CryptoMarket:
     market: Market
     yes_token_id: str
     no_token_id: str
     direction: str          # "above" | "below"
     threshold: float        # USD price threshold
     resolution_dt: Optional[datetime]   # resolved at this UTC time
+    asset: str = "btcusdt"  # Binance symbol (btcusdt/ethusdt/solusdt/xrpusdt)
+
+
+# Backward-compat alias
+BTCMarket = CryptoMarket
 
 
 @dataclass
 class LatencyArbTrade:
-    market: BTCMarket
+    market: CryptoMarket
     side: str               # "YES" | "NO"
     token_id: str
     entry_price: float
@@ -87,16 +99,16 @@ class LatencyArbTrade:
 
 class LatencyArbStrategy:
     """
-    Monitors BTC threshold markets for latency arbitrage opportunities.
+    Monitors BTC/ETH/SOL/XRP threshold markets for latency arbitrage opportunities.
     """
 
-    def __init__(self, client: PolymarketClient, price_feed: BTCPriceFeed):
+    def __init__(self, client: PolymarketClient, price_feed: CryptoPriceFeed):
         self.client = client
         self.price_feed = price_feed
-        self._btc_markets: list[BTCMarket] = []
+        self._crypto_markets: list[CryptoMarket] = []
         self._trades: list[LatencyArbTrade] = []
         self._last_market_refresh = 0.0
-        self._market_refresh_interval = 120.0   # refresh market list every 2 min
+        self._market_refresh_interval = 60.0   # refresh every 60s (was 120s — Gap 7 fix)
         self._sizer: Optional["PositionSizer"] = None
         self._health: Optional["HealthState"] = None
 
@@ -110,25 +122,31 @@ class LatencyArbStrategy:
     # Market discovery
     # ------------------------------------------------------------------
 
-    async def _refresh_btc_markets(self, all_markets: list[Market]):
-        """Filter and parse BTC threshold markets from the full market list."""
+    async def _refresh_crypto_markets(self, all_markets: list[Market]):
+        """Filter and parse crypto threshold markets from the full market list."""
         parsed = []
         for m in all_markets:
-            btc_market = self._parse_btc_market(m)
-            if btc_market:
-                parsed.append(btc_market)
+            crypto_market = self._parse_crypto_market(m)
+            if crypto_market:
+                parsed.append(crypto_market)
 
-        self._btc_markets = parsed
-        log.info("LatencyArb: found %d BTC threshold markets", len(parsed))
+        self._crypto_markets = parsed
+        log.info("LatencyArb: found %d crypto threshold markets", len(parsed))
 
-    def _parse_btc_market(self, market: Market) -> Optional[BTCMarket]:
+    def _parse_crypto_market(self, market: Market) -> Optional[CryptoMarket]:
         """
-        Try to parse a market's question into a BTCMarket.
-        Returns None if the market isn't a BTC threshold market.
+        Try to parse a market's question into a CryptoMarket.
+        Returns None if the market isn't a supported crypto threshold market.
         """
         q = market.question.lower()
-        # Must be about BTC/Bitcoin
-        if "btc" not in q and "bitcoin" not in q:
+
+        # Match the first recognized crypto keyword (BTC/ETH/SOL/XRP)
+        matched_asset = None
+        for keyword, symbol in _CRYPTO_KEYWORDS.items():
+            if keyword in q:
+                matched_asset = symbol
+                break
+        if not matched_asset:
             return None
 
         threshold_match = _THRESHOLD_RE.search(market.question)
@@ -152,18 +170,18 @@ class LatencyArbStrategy:
         # Resolution time — try end_date_iso first, then parse question
         resolution_dt = self._parse_resolution_time(market)
 
-        return BTCMarket(
+        return CryptoMarket(
             market=market,
             yes_token_id=yes_id,
             no_token_id=no_id,
             direction=direction,
             threshold=threshold,
             resolution_dt=resolution_dt,
+            asset=matched_asset,
         )
 
     def _parse_resolution_time(self, market: Market) -> Optional[datetime]:
         """Parse resolution datetime from market metadata or question."""
-        # Try ISO date from market data
         try:
             if market.end_date_iso:
                 dt = datetime.fromisoformat(
@@ -201,37 +219,40 @@ class LatencyArbStrategy:
         self, all_markets: list[Market]
     ) -> list[LatencyArbTrade]:
         """
-        Scan all BTC markets for latency arb opportunities.
-
+        Scan all crypto markets for latency arb opportunities.
         Returns a list of potential trades (not yet executed).
         """
         # Refresh market list periodically
         now = time.monotonic()
         if now - self._last_market_refresh > self._market_refresh_interval:
-            await self._refresh_btc_markets(all_markets)
+            await self._refresh_crypto_markets(all_markets)
             self._last_market_refresh = now
 
-        spot = self.price_feed.price
-        if not spot or not self.price_feed.is_fresh:
-            log.warning("LatencyArb: BTC price unavailable or stale")
-            return []
-
         opportunities = []
-        for btc_market in self._btc_markets:
-            trade = await self._evaluate(btc_market, spot)
+        for crypto_market in self._crypto_markets:
+            # Per-asset price freshness check (not global BTC-only abort)
+            spot = self.price_feed.get_price(crypto_market.asset)
+            if not spot or not self.price_feed.is_fresh_for(crypto_market.asset):
+                log.debug(
+                    "LatencyArb: %s price unavailable or stale",
+                    crypto_market.asset,
+                )
+                continue
+
+            trade = await self._evaluate(crypto_market, spot)
             if trade:
                 opportunities.append(trade)
 
         return opportunities
 
     async def _evaluate(
-        self, btc_market: BTCMarket, spot: float
+        self, crypto_market: CryptoMarket, spot: float
     ) -> Optional[LatencyArbTrade]:
         """
-        Evaluate a single BTC market.
+        Evaluate a single crypto market.
         Returns a LatencyArbTrade if profitable, else None.
         """
-        resolution_dt = btc_market.resolution_dt
+        resolution_dt = crypto_market.resolution_dt
         if resolution_dt is None:
             return None
 
@@ -242,11 +263,16 @@ class LatencyArbStrategy:
         if secs_remaining < 0 or secs_remaining > WINDOW_SECS:
             return None
 
-        threshold = btc_market.threshold
-        direction = btc_market.direction
+        threshold = crypto_market.threshold
+        direction = crypto_market.direction
         gap_pct = abs(spot - threshold) / threshold
 
-        if gap_pct < CERTAINTY_GAP_PCT:
+        # Time-adjusted certainty gap (Gap 3 fix):
+        # At T-WINDOW_SECS, require the full CERTAINTY_GAP_PCT.
+        # At T-5s, accept 40% of the normal gap — outcome is nearly certain.
+        time_factor = max(0.4, secs_remaining / WINDOW_SECS)
+        adjusted_gap = config.CERTAINTY_GAP_PCT * time_factor
+        if gap_pct < adjusted_gap:
             return None     # too close to threshold, outcome uncertain
 
         # Determine which side is winning
@@ -257,11 +283,15 @@ class LatencyArbStrategy:
 
         # Get the current price of the winning token
         token_id = (
-            btc_market.yes_token_id
+            crypto_market.yes_token_id
             if winning_side == "YES"
-            else btc_market.no_token_id
+            else crypto_market.no_token_id
         )
         _, ask = await self.client.get_best_prices(token_id)
+
+        # ask=0 means no liquidity (Bug 7 fix: failure returns (0, 0) now)
+        if ask <= 0:
+            return None
 
         # Fair value is ~1.0 since this is near-certain
         fair_value = 1.0 - config.POLYMARKET_FEE
@@ -271,9 +301,9 @@ class LatencyArbStrategy:
             return None
 
         if self._sizer is not None:
-            # Confidence: scales with how far BTC is from the threshold.
+            # Confidence: scales with how far spot is from the threshold.
             # At the minimum certainty gap → 0.25; at 4× the gap → 1.0.
-            confidence = min(1.0, gap_pct / (CERTAINTY_GAP_PCT * 4))
+            confidence = min(1.0, gap_pct / (config.CERTAINTY_GAP_PCT * 4))
             edge_bps = discount * 10_000   # discount fraction → basis points
             health_level = self._health.level if self._health else None
             sr = self._sizer.compute(
@@ -286,29 +316,34 @@ class LatencyArbStrategy:
             if sr.size_usdc == 0:
                 log.debug(
                     "LatencyArb: sizer blocked %s (reason=%s)",
-                    market_label(btc_market.market), sr.reason,
+                    market_label(crypto_market.market), sr.reason,
                 )
                 return None
-            size_usdc = sr.size_usdc
+
+            # Time-decay position scaling (Gap 6 fix):
+            # Near expiry, outcome certainty is >99.9% — scale up to 1.5×.
+            time_urgency = 1.0 - (secs_remaining / WINDOW_SECS)
+            time_multiplier = 1.0 + (time_urgency * 0.5)   # 1.0× → 1.5×
+            size_usdc = min(sr.size_usdc * time_multiplier, config.SIZE_MAX_USDC)
         else:
-            # Fallback: fixed cap (no sizer wired yet)
+            # Fallback: fixed cap (sizer not wired)
             size_usdc = min(config.MAX_POSITION_USDC, 200)
 
         expected_profit = discount * (size_usdc / ask)
 
         log.info(
-            "LatencyArb opportunity | %s | BTC=%.2f threshold=%.2f (%s) | "
+            "LatencyArb opportunity | %s | %s=%.4f threshold=%.2f (%s) | "
             "%.0fs left | %s ask=%.4f fair=%.4f discount=%.4f | "
             "expected profit: %.2f USDC",
-            market_label(btc_market.market),
-            spot, threshold, direction,
+            market_label(crypto_market.market),
+            crypto_market.asset, spot, threshold, direction,
             secs_remaining,
             winning_side, ask, fair_value, discount,
             expected_profit,
         )
 
         return LatencyArbTrade(
-            market=btc_market,
+            market=crypto_market,
             side=winning_side,
             token_id=token_id,
             entry_price=ask,
@@ -344,6 +379,21 @@ class LatencyArbStrategy:
         return trade
 
     # ------------------------------------------------------------------
+    # Adaptive timing helpers
+    # ------------------------------------------------------------------
+
+    def nearest_expiry_secs(self) -> Optional[float]:
+        """Return seconds until the nearest tracked market expires (within 5 min)."""
+        now_utc = datetime.now(timezone.utc)
+        candidates = []
+        for m in self._crypto_markets:
+            if m.resolution_dt:
+                s = (m.resolution_dt - now_utc).total_seconds()
+                if 0 < s < 300:
+                    candidates.append(s)
+        return min(candidates) if candidates else None
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -357,8 +407,9 @@ class LatencyArbStrategy:
         while True:
             try:
                 trades = await self.scan_once(markets_ref)
-                for trade in trades:
-                    await self.execute(trade)
+                if trades:
+                    # Execute all opportunities in parallel (Gap 5 fix)
+                    await asyncio.gather(*[self.execute(t) for t in trades])
             except asyncio.CancelledError:
                 break
             except Exception as exc:

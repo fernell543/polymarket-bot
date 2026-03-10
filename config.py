@@ -49,7 +49,8 @@ VOL_MULT_MID        = float(os.getenv("VOL_MULT_MID",        "1.0"))
 VOL_MULT_HIGH       = float(os.getenv("VOL_MULT_HIGH",       "0.6"))
 
 # Guard: signal confidence below this → size=0 (trade skipped entirely).
-CONFIDENCE_FLOOR    = float(os.getenv("CONFIDENCE_FLOOR",    "0.20"))
+# 0.10 is the optimal floor for latency arb (gap/4 formula can yield 0.125 at threshold).
+CONFIDENCE_FLOOR    = float(os.getenv("CONFIDENCE_FLOOR",    "0.10"))
 
 # Guard: net expected edge below this → size=0.
 # 50 bps = 0.5 %.  Must exceed fees + slippage to be worth trading.
@@ -79,17 +80,21 @@ POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "2"))
 # Polymarket fee is 2% of winnings
 POLYMARKET_FEE = 0.02
 
-# Binance WebSocket for BTC/USDT real-time trades
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+# Binance WebSocket — multi-asset combined stream (BTC/ETH/SOL/XRP)
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade"
 
 # Coinbase Advanced Trade WebSocket
 COINBASE_WS_URL = "wss://advanced-trade-api.coinbase.com/ws"
 
 # Latency arb: enter position if this many seconds remain before market resolution
-LATENCY_ARB_WINDOW_SECS = 60
+LATENCY_ARB_WINDOW_SECS = int(os.getenv("LATENCY_ARB_WINDOW_SECS", "60"))
 
 # Latency arb: minimum price discount vs fair value to enter
-LATENCY_ARB_MIN_DISCOUNT = 0.05
+LATENCY_ARB_MIN_DISCOUNT = float(os.getenv("LATENCY_ARB_MIN_DISCOUNT", "0.05"))
+
+# Latency arb: minimum gap between spot price and threshold (fraction of threshold).
+# E.g. 0.003 = 0.3% away.  Time-adjusted in strategy: relaxes to 40% near expiry.
+CERTAINTY_GAP_PCT = float(os.getenv("CERTAINTY_GAP_PCT", "0.005"))
 
 # Market making: rebalance interval in seconds
 MM_REBALANCE_INTERVAL = 30
@@ -154,16 +159,17 @@ RISK_MAX_DRAWDOWN = float(os.getenv("RISK_MAX_DRAWDOWN", "200.0"))
 # After this many consecutive losing trades → enter cooldown.
 RISK_MAX_CONSECUTIVE_LOSSES = int(os.getenv("RISK_MAX_CONSECUTIVE_LOSSES", "3"))
 
-# Duration of consecutive-loss cooldown in seconds (default 5 minutes).
-RISK_COOLDOWN_SECS = int(os.getenv("RISK_COOLDOWN_SECS", "300"))
+# Duration of consecutive-loss cooldown in seconds.
+# 300s (5min) misses ~30 opportunities. Reduced to 60s.
+RISK_COOLDOWN_SECS = int(os.getenv("RISK_COOLDOWN_SECS", "60"))
 
 # ---------------------------------------------------------------------------
 # Execution layer
 # ---------------------------------------------------------------------------
 
 # Minimum net edge (after fee + slippage) required to place an order.
-# 0.010 = 1%.  Set higher to be more selective.
-EXEC_MIN_EDGE = float(os.getenv("EXEC_MIN_EDGE", "0.010"))
+# Reduced to 0.5% to match EDGE_FLOOR_BPS — the two gates were redundant (Gap 10 fix).
+EXEC_MIN_EDGE = float(os.getenv("EXEC_MIN_EDGE", "0.005"))
 
 # Signal confidence >= this → prefer market (taker) order for faster fill.
 EXEC_TAKER_CONFIDENCE_THRESHOLD = float(
@@ -340,15 +346,16 @@ CONTROL_MODE = os.getenv("CONTROL_MODE", "manual")
 LIVE_DEPLOY_MODE = os.getenv("LIVE_DEPLOY_MODE", "staircase_A")
 
 # Max orders per minute (token-bucket throttle, shared across all strategies).
-# Hard cap prevents runaway loops from hammering the API.
-LIVE_MAX_ORDER_RATE = int(os.getenv("LIVE_MAX_ORDER_RATE", "10"))
+# Raised from 10 → 30: 10/min is too low for multi-asset high-frequency arb.
+LIVE_MAX_ORDER_RATE = int(os.getenv("LIVE_MAX_ORDER_RATE", "30"))
 
 # Minimum market depth (sum of top-N bid+ask levels, USDC) to allow entry.
-# Markets thinner than this have unpredictable fill rates and high slippage.
-LIVE_MIN_DEPTH_USDC = float(os.getenv("LIVE_MIN_DEPTH_USDC", "100.0"))
+# Lowered from 100 → 50: binary markets are thin, 100 blocked too many trades.
+LIVE_MIN_DEPTH_USDC = float(os.getenv("LIVE_MIN_DEPTH_USDC", "50.0"))
 
 # Spread stability window: require that spread has not changed >X% in last Y secs.
-LIVE_SPREAD_STABILITY_SECS = int(os.getenv("LIVE_SPREAD_STABILITY_SECS", "5"))
+# Disabled (0) for latency arb — spread widening IS the opportunity (Gap 11 fix).
+LIVE_SPREAD_STABILITY_SECS = int(os.getenv("LIVE_SPREAD_STABILITY_SECS", "0"))
 LIVE_SPREAD_MAX_MOVE_PCT = float(os.getenv("LIVE_SPREAD_MAX_MOVE_PCT", "0.50"))  # 50% spread-widening allowed
 
 # Avoid-chase: if price has moved more than this fraction of spread since signal,
