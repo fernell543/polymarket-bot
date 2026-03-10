@@ -1,8 +1,8 @@
 """
-Real-time BTC/USD price feed via Binance WebSocket.
+Real-time crypto price feed via Binance WebSocket.
 
-Keeps a rolling best-price estimate updated in-memory.
-Falls back to Coinbase REST if the WebSocket drops.
+Maintains rolling best-price estimates for BTC, ETH, SOL, and XRP.
+Falls back to Binance REST then Coinbase REST per symbol if the WebSocket drops.
 """
 
 import asyncio
@@ -18,67 +18,105 @@ import config
 
 log = logging.getLogger(__name__)
 
-BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-BINANCE_REST = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-COINBASE_REST = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+# All supported symbols (must match _CRYPTO_KEYWORDS in latency_arb.py)
+SYMBOLS = ["btcusdt", "ethusdt", "solusdt", "xrpusdt"]
+
+# Binance combined stream — 4 assets, one WebSocket connection
+BINANCE_MULTI_WS = config.BINANCE_WS_URL
+BINANCE_REST_BASE = "https://api.binance.com/api/v3/ticker/price?symbol={}"
+COINBASE_REST_BASE = "https://api.coinbase.com/v2/prices/{}-USD/spot"
+
+_COINBASE_TICKER = {
+    "btcusdt": "BTC",
+    "ethusdt": "ETH",
+    "solusdt": "SOL",
+    "xrpusdt": "XRP",
+}
 
 # Price is considered stale (feed likely disconnected) after this many seconds
 STALE_SECS = 60
 
 
-class BTCPriceFeed:
+class CryptoPriceFeed:
     """
-    Singleton-like class that maintains the latest BTC/USD price.
+    Maintains the latest spot prices for BTC, ETH, SOL, and XRP.
 
     Usage:
-        feed = BTCPriceFeed()
+        feed = CryptoPriceFeed()
         asyncio.create_task(feed.run())
         ...
-        price = feed.price   # always current
+        btc_price = feed.get_price("btcusdt")
+        if feed.is_fresh_for("ethusdt"):
+            eth_price = feed.get_price("ethusdt")
     """
 
     def __init__(self):
-        self._price: float = 0.0
-        self._last_update: float = 0.0
+        self._prices: dict[str, float] = {}
+        self._last_updates: dict[str, float] = {}
         self._running = False
+
+    # ------------------------------------------------------------------
+    # Per-symbol API (new)
+    # ------------------------------------------------------------------
+
+    def get_price(self, symbol: str) -> float:
+        """Return the latest price for a symbol (0.0 if unavailable)."""
+        return self._prices.get(symbol, 0.0)
+
+    def age_secs_for(self, symbol: str) -> float:
+        """Seconds since last update for a given symbol."""
+        t = self._last_updates.get(symbol, 0.0)
+        if t == 0.0:
+            return float("inf")
+        return time.monotonic() - t
+
+    def is_fresh_for(self, symbol: str) -> bool:
+        """True if price for symbol was updated in the last 5 seconds."""
+        return self.age_secs_for(symbol) < 5
+
+    def has_price_for(self, symbol: str) -> bool:
+        """True if at least one valid price has been received for symbol."""
+        return self._prices.get(symbol, 0.0) > 0
+
+    # ------------------------------------------------------------------
+    # Backward-compatible BTC properties (used by bot.py health checks)
+    # ------------------------------------------------------------------
 
     @property
     def price(self) -> float:
-        return self._price
+        """BTC/USD price (backward compat)."""
+        return self.get_price("btcusdt")
 
     @property
     def age_secs(self) -> float:
-        """Seconds since last price update."""
-        return time.monotonic() - self._last_update
+        """Seconds since last BTC update."""
+        return self.age_secs_for("btcusdt")
 
     @property
     def has_price(self) -> bool:
-        """True once at least one valid price has been received."""
-        return self._last_update > 0 and self._price > 0
+        """True once any valid price has been received."""
+        return any(v > 0 for v in self._prices.values())
 
     @property
     def is_fresh(self) -> bool:
-        """True if price was updated in the last 5 seconds."""
-        return self.age_secs < 5
+        """True if BTC price was updated in the last 5 seconds."""
+        return self.is_fresh_for("btcusdt")
 
     @property
     def is_stale(self) -> bool:
-        """True if feed connected before but hasn't updated in STALE_SECS.
-        Indicates the WebSocket/REST connection has likely dropped.
-        """
-        return self.has_price and self.age_secs > STALE_SECS
+        """True if BTC feed connected before but hasn't updated in STALE_SECS."""
+        return self.has_price_for("btcusdt") and self.age_secs > STALE_SECS
 
-    def _update(self, price: float):
-        self._price = price
-        self._last_update = time.monotonic()
+    def _update(self, symbol: str, price: float):
+        self._prices[symbol] = price
+        self._last_updates[symbol] = time.monotonic()
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
     async def run(self):
-        """
-        Run the price feed loop indefinitely.
+        """Run the price feed loop indefinitely.
         Tries Binance WebSocket; falls back to REST polling on errors.
         """
         self._running = True
@@ -97,43 +135,52 @@ class BTCPriceFeed:
     # ------------------------------------------------------------------
 
     async def _binance_ws_loop(self):
-        async with websockets.connect(BINANCE_WS, ping_interval=20) as ws:
-            log.info("Connected to Binance BTC/USDT trade stream")
+        async with websockets.connect(BINANCE_MULTI_WS, ping_interval=20) as ws:
+            log.info("Connected to Binance multi-asset trade stream (%s)", BINANCE_MULTI_WS)
             async for raw in ws:
                 msg = json.loads(raw)
-                # Trade message: {"p": "price", "q": "qty", ...}
-                if "p" in msg:
-                    self._update(float(msg["p"]))
+                # Combined stream wraps data: {"stream": "...", "data": {...}}
+                # Single stream sends data directly without wrapping.
+                data = msg.get("data", msg)
+                if "p" in data and "s" in data:
+                    symbol = data["s"].lower()
+                    if symbol in _COINBASE_TICKER:
+                        self._update(symbol, float(data["p"]))
 
     # ------------------------------------------------------------------
     # REST fallback (used on demand when WS is unavailable)
     # ------------------------------------------------------------------
 
     async def fetch_once(self) -> Optional[float]:
-        """Fetch price once from Binance REST (no WebSocket)."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    BINANCE_REST, timeout=aiohttp.ClientTimeout(total=5)
-                ) as resp:
-                    data = await resp.json()
-                    price = float(data["price"])
-                    self._update(price)
-                    return price
-        except Exception as exc:
-            log.debug("Binance REST fallback failed: %s", exc)
+        """Fetch prices once from REST for all symbols. Returns BTC price."""
+        async with aiohttp.ClientSession() as session:
+            for symbol in SYMBOLS:
+                await self._fetch_symbol_rest(session, symbol)
+        return self.get_price("btcusdt") or None
 
-        # Try Coinbase as second fallback
+    async def _fetch_symbol_rest(
+        self, session: aiohttp.ClientSession, symbol: str
+    ) -> None:
+        """Fetch a single symbol from Binance REST, falling back to Coinbase."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    COINBASE_REST, timeout=aiohttp.ClientTimeout(total=5)
-                ) as resp:
-                    data = await resp.json()
-                    price = float(data["data"]["amount"])
-                    self._update(price)
-                    return price
+            url = BINANCE_REST_BASE.format(symbol.upper())
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                data = await resp.json()
+                self._update(symbol, float(data["price"]))
+                return
         except Exception as exc:
-            log.debug("Coinbase REST fallback failed: %s", exc)
+            log.debug("Binance REST for %s failed: %s", symbol, exc)
 
-        return None
+        coinbase_sym = _COINBASE_TICKER.get(symbol)
+        if coinbase_sym:
+            try:
+                url = COINBASE_REST_BASE.format(coinbase_sym)
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    data = await resp.json()
+                    self._update(symbol, float(data["data"]["amount"]))
+            except Exception as exc:
+                log.debug("Coinbase REST for %s failed: %s", symbol, exc)
+
+
+# Backward-compat alias so `from feeds.price_feed import BTCPriceFeed` still works
+BTCPriceFeed = CryptoPriceFeed

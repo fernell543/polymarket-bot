@@ -74,7 +74,7 @@ class Bot:
       - BTC price feed is stale (is_stale=True, age > 60 s)
     """
 
-    MARKETS_REFRESH_SECS = 120
+    MARKETS_REFRESH_SECS = 60   # was 120 — Gap 7 fix: catch new markets faster
     STATS_INTERVAL_SECS  = 60
 
     def __init__(self):
@@ -504,13 +504,17 @@ class Bot:
                     continue
 
                 trades = await self.latency_arb.scan_once(self._markets_cache)
-                for trade in trades:
-                    await self.latency_arb.execute(trade)
+                if trades:
+                    # Execute all opportunities in parallel (Gap 5 fix)
+                    await asyncio.gather(*[self.latency_arb.execute(t) for t in trades])
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 log.error("LatencyArb error: %s", exc, exc_info=True)
-            await asyncio.sleep(5)
+            # Adaptive poll interval (Gap 8 fix): 1s near expiry, 5s otherwise
+            nearest = self.latency_arb.nearest_expiry_secs()
+            poll = 1.0 if nearest and nearest < 30 else (3.0 if nearest and nearest < 60 else 5.0)
+            await asyncio.sleep(poll)
 
     async def _market_maker_loop(self):
         log.info("MarketMaker loop starting")
@@ -693,8 +697,11 @@ class Bot:
             f"  Health:        {self.health.summary}",
             f"  KillSwitch:    {self.kill_switch.summary}",
             f"  Markets:       {len(self._markets_cache)} active",
-            f"  BTC price:     ${self.price_feed.price:,.2f} "
-            f"(age {self.price_feed.age_secs:.1f}s)",
+            f"  Prices:        BTC=${self.price_feed.get_price('btcusdt'):,.0f} "
+            f"ETH=${self.price_feed.get_price('ethusdt'):,.0f} "
+            f"SOL=${self.price_feed.get_price('solusdt'):.2f} "
+            f"XRP=${self.price_feed.get_price('xrpusdt'):.4f} "
+            f"(BTC age {self.price_feed.age_secs:.1f}s)",
             f"  Risk:          {risk_st.summary}",
             f"  FillQuality:   placed={fq_st['total_placed']} "
             f"cancelled={fq_st['total_cancelled']} "

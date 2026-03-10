@@ -283,15 +283,20 @@ class PolymarketClient:
         )
 
     async def get_best_prices(self, token_id: str) -> tuple[float, float]:
-        """Return (best_bid, best_ask) for a token. Returns (0, 1) on failure."""
+        """Return (best_bid, best_ask) for a token. Returns (0, 0) on failure.
+
+        IMPORTANT: Returns (0.0, 0.0) — NOT (0.0, 1.0) — on failure.
+        ask=1.0 would pass the discount check and trigger a zero-profit buy.
+        Callers must treat ask=0 as "no liquidity, skip trade" (Bug 7 fix).
+        """
         try:
             book = await self.get_order_book(token_id)
             best_bid = max((p for p, _ in book.bids), default=0.0)
-            best_ask = min((p for p, _ in book.asks), default=1.0)
+            best_ask = min((p for p, _ in book.asks), default=0.0)
             return best_bid, best_ask
         except Exception as exc:
             log.debug("get_best_prices(%s) failed: %s", token_id, exc)
-            return 0.0, 1.0
+            return 0.0, 0.0
 
     async def get_midpoint(self, token_id: str) -> float:
         bid, ask = await self.get_best_prices(token_id)
